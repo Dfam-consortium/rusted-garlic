@@ -372,7 +372,7 @@ pub fn profile_trf(
             continue;
         }
         if f[3] != "trf" {
-            eprintln!("warning: TRF file line not in expected format, skipping: {}", line);
+            log::warn!("TRF file line not in expected format, skipping: {}", line);
             continue;
         }
 

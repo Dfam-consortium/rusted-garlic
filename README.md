@@ -37,10 +37,12 @@ All dependencies are declared in `Cargo.toml` and fetched automatically by Cargo
 
 ## Quick start
 
+`rusted-garlic` has two subcommands: `build` (create a model from a genome) and `emit` (generate sequences from a model).
+
 ### 1. Build a model from a genome FASTA
 
 ```bash
-rusted-garlic --in_seq genome.fa --model genome.model
+rusted-garlic build --in_seq genome.fa --model genome.model
 ```
 
 This makes a single pass over the FASTA, computes GC content per window (default 1 kb), assigns windows to up to 25 equal-population GC bins, and counts 4-mer frequencies within each bin.  Progress is printed to stderr.
@@ -48,7 +50,7 @@ This makes a single pass over the FASTA, computes GC content per window (default
 Use `-w`, `-k`, and `-n` to override the defaults:
 
 ```bash
-rusted-garlic --in_seq genome.fa --model genome.model \
+rusted-garlic build --in_seq genome.fa --model genome.model \
   --win_size 500 --kmer_size 5 --num_gc_bins 20
 ```
 
@@ -57,7 +59,7 @@ rusted-garlic --in_seq genome.fa --model genome.model \
 ### 2. Generate an artificial sequence from the saved model
 
 ```bash
-rusted-garlic --model genome.model --out_seq artificial.fa --seq_size 10m
+rusted-garlic emit --model genome.model --out_seq artificial.fa --seq_size 10m
 ```
 
 `--seq_size` accepts bare integers or the suffixes `k`, `m`, `g` (case-insensitive).  Without `--seq_size` the output is the same length as the input genome.
@@ -67,17 +69,11 @@ rusted-garlic --model genome.model --out_seq artificial.fa --seq_size 10m
 Use `-N` / `--num_seqs` to write several independent sequences into a single FASTA file:
 
 ```bash
-rusted-garlic --model genome.model --out_seq artificial.fa \
+rusted-garlic emit --model genome.model --out_seq artificial.fa \
   --seq_size 5m --num_seqs 10
 ```
 
 The sequences are named `artificial_sequence_1`, `artificial_sequence_2`, … `artificial_sequence_N`.  When `--num_seqs 1` (the default) the name is just `artificial_sequence`.  Each sequence is drawn independently from the same model with its own random seed, so repeat fractions and GC bin walks differ between sequences.
-
-### 3. Build and emit in a single step
-
-```bash
-rusted-garlic --in_seq genome.fa --out_seq artificial.fa --seq_size 5m
-```
 
 ---
 
@@ -102,7 +98,7 @@ All input files are auto-detected as gzip-compressed when their name ends in `.g
 ### Step 2 — Build a masked model with repeat profiling
 
 ```bash
-rusted-garlic \
+rusted-garlic build \
   --in_seq    genome.fa \
   --model     genome.model \
   --repeats   genome.fa.align \
@@ -126,9 +122,9 @@ genome.inserts.W1000.data   # Nested insertion frequency table
 ### Step 3 — Generate a sequence with TE bombardment
 
 ```bash
-rusted-garlic \
-  --model   genome.model \
-  --out_seq artificial.fa \
+rusted-garlic emit \
+  --model    genome.model \
+  --out_seq  artificial.fa \
   --seq_size 10m \
   --te_cons  RepeatMaskerLib.fa \
   --te_frac  30 \
@@ -149,29 +145,28 @@ If `--te_frac` or `--sim_frac` are omitted the fractions are drawn randomly each
 
 ## All command-line options
 
+### `build` subcommand
+
 ```
-rusted-garlic [OPTIONS]
+rusted-garlic build --in_seq <FASTA_FILE> --model <MODEL_FILE> [OPTIONS]
 ```
 
-**Input / output**
+**Required**
 
-| Flag | Default | Description |
-|---|---|---|
-| `-i, --in_seq <FASTA_FILE>` | — | Input genome FASTA — builds a new model |
-| `-m, --model <MODEL_FILE>` | — | Save model (with `--in_seq`) or load model (alone) |
-| `-o, --out_seq <FASTA_FILE>` | — | Write artificial sequence(s) here |
-| `-s, --seq_size <SIZE>` | input length | Output length per sequence: integer with optional `k`/`m`/`g` suffix |
-| `-N, --num_seqs <INT>` | `1` | Number of independent sequences to generate |
+| Flag | Description |
+|---|---|
+| `-i, --in_seq <FASTA_FILE>` | Input genome FASTA |
+| `-m, --model <MODEL_FILE>` | Model file to save |
 
-**Annotation / masking (model-build only)**
+**Annotation / masking**
 
-| Flag | Default | Description |
-|---|---|---|
-| `-r, --repeats <ALIGN_FILE>` | — | RepeatMasker `.align` or `.out` for masking + TE profiling |
-| `-t, --trf <BED_FILE>` | — | UCSC TRF BED for masking + simple repeat profiling |
-| `-g, --genes <GENE_FILE>` | — | UCSC refGene/ensGene table for gene-body masking |
+| Flag | Description |
+|---|---|
+| `-r, --repeats <ALIGN_FILE>` | RepeatMasker `.align` or `.out` for masking + TE profiling |
+| `-t, --trf <BED_FILE>` | UCSC TRF BED for masking + simple repeat profiling |
+| `-g, --genes <GENE_FILE>` | UCSC refGene/ensGene table for gene-body masking |
 
-**Model parameters (model-build only — stored in the model file)**
+**Model parameters (stored in the model file)**
 
 | Flag | Default | Description |
 |---|---|---|
@@ -179,17 +174,57 @@ rusted-garlic [OPTIONS]
 | `-k, --kmer_size <INT>` | `4` | k-mer size for the Markov base-frequency model |
 | `-n, --num_gc_bins <INT>` | `25` | Maximum number of GC isochore bins |
 
-**Repeat bombardment (emit only)**
+### `emit` subcommand
+
+```
+rusted-garlic emit --model <MODEL_FILE> --out_seq <FASTA_FILE> [OPTIONS]
+```
+
+**Required**
+
+| Flag | Description |
+|---|---|
+| `-m, --model <MODEL_FILE>` | Model file to load |
+| `-o, --out_seq <FASTA_FILE>` | Write artificial sequence(s) here |
+
+**Sequence generation**
 
 | Flag | Default | Description |
 |---|---|---|
-| `--te_cons <FASTA_FILE>` | — | TE consensus FASTA — enables TE bombardment |
-| `--te_frac <PERCENT>` | random 10–60 | Target TE fraction 0–100 |
+| `-s, --seq_size <SIZE>` | input length | Output length per sequence: integer with optional `k`/`m`/`g` suffix; not valid with `evenly-spaced` mode |
+| `-N, --num_seqs <INT>` | `1` | Number of independent sequences to generate |
+
+**Internal repeat bombardment (legacy)**
+
+| Flag | Default | Description |
+|---|---|---|
+| `--te_cons <FASTA_FILE>` | — | TE consensus FASTA — enables internal TE bombardment |
+| `--te_frac <PERCENT>` | random 10–60 | Target TE coverage 0–100; also used by `coverage` insertion mode |
 | `--sim_frac <PERCENT>` | random 0–2 | Target simple-repeat fraction 0–100 |
+
+**External feature insertion**
+
+| Flag | Default | Description |
+|---|---|---|
+| `--insert_features <FASTA_FILE>` | — | Feature sequences to insert into the background |
+| `--insert_mode <MODE>` | `coverage` | `coverage`, `full`, or `evenly-spaced` (see below) |
+| `--spacing <BP>` | — | Background bp between features; required for `evenly-spaced`, disallowed otherwise |
+| `--allow_nesting` | off | Allow features to overlap prior insertions; `coverage` and `full` only |
+
+**Output**
+
+| Flag | Default | Description |
+|---|---|---|
 | `--no_soft_mask` | off | Keep inserted repeats uppercase (default: lower-case) |
 | `--out_bed <BED_FILE>` | — | Write repeat insertion records as a 6-column BED file |
 
-Either `--in_seq` or `--model` (to load) must be present.
+#### Insertion modes
+
+| Mode | Required extras | Disallowed | Behaviour |
+|---|---|---|---|
+| `coverage` | `--te_frac` (or accepts random default) | `--spacing` | Draw features until `--te_frac` percent coverage is reached |
+| `full` | — | `--spacing` | Insert every feature in the FASTA exactly once |
+| `evenly-spaced` | `--spacing` | `--seq_size`, `--allow_nesting` | Place features in order with exactly `--spacing` bp of background between each; output length is determined by the feature set |
 
 ---
 
@@ -230,7 +265,7 @@ RepeatMasker -pa 16 -species human -align chr22.fa
 ### Build the model
 
 ```bash
-rusted-garlic \
+rusted-garlic build \
   --in_seq  chr22.fa \
   --model   chr22.model \
   --repeats chr22.fa.align \
@@ -257,9 +292,9 @@ Writing insert table to "chr22.inserts.W1000.data"...
 ### Generate a 10 Mb test sequence
 
 ```bash
-rusted-garlic \
-  --model   chr22.model \
-  --out_seq chr22_artificial.fa \
+rusted-garlic emit \
+  --model    chr22.model \
+  --out_seq  chr22_artificial.fa \
   --seq_size 10m \
   --te_cons  RepeatMaskerLib.fa \
   --te_frac  32 \
@@ -271,9 +306,9 @@ rusted-garlic \
 To produce a benchmark set of 20 independent 5 Mb sequences in one pass:
 
 ```bash
-rusted-garlic \
-  --model   chr22.model \
-  --out_seq chr22_bench.fa \
+rusted-garlic emit \
+  --model    chr22.model \
+  --out_seq  chr22_bench.fa \
   --seq_size 5m \
   --num_seqs 20 \
   --te_cons  RepeatMaskerLib.fa \
@@ -288,23 +323,23 @@ The output FASTA will contain 20 records named `artificial_sequence_1` … `arti
 To use 5-mers and 500 bp windows (e.g. for a GC-rich or compact genome):
 
 ```bash
-rusted-garlic \
-  --in_seq   chr22.fa \
-  --model    chr22_k5w500.model \
-  --repeats  chr22.fa.align \
-  --trf      chr22.trf.bed \
-  --genes    refGene.txt \
-  --kmer_size 5 \
-  --win_size  500 \
+rusted-garlic build \
+  --in_seq      chr22.fa \
+  --model       chr22_k5w500.model \
+  --repeats     chr22.fa.align \
+  --trf         chr22.trf.bed \
+  --genes       refGene.txt \
+  --kmer_size   5 \
+  --win_size    500 \
   --num_gc_bins 20
 ```
 
 Then generate sequences as usual — the stored parameters are applied automatically:
 
 ```bash
-rusted-garlic \
-  --model   chr22_k5w500.model \
-  --out_seq artificial_k5.fa \
+rusted-garlic emit \
+  --model    chr22_k5w500.model \
+  --out_seq  artificial_k5.fa \
   --seq_size 10m \
   --te_cons  RepeatMaskerLib.fa
 ```
@@ -328,7 +363,7 @@ print(f'Repeat: {lc} bp  ({100*lc/total:.1f}%)')
 
 ## Sidecar files
 
-When `--model` is saved and `--repeats` was provided, two text files are written in the same directory that are compatible with the original Perl `createFakeSequence.pl`.  The filenames always use the `W1000` suffix for Perl compatibility regardless of `--win_size`:
+When `build` is run with `--repeats`, two text files are written alongside the model that are compatible with the original Perl `createFakeSequence.pl`.  The filenames always use the `W1000` suffix for Perl compatibility regardless of `--win_size`:
 
 **`<stem>.repeats.W1000.data`** — one record per TE / simple repeat per GC bin:
 ```
@@ -350,7 +385,7 @@ AluSx#SINE/Alu    L1HS#LINE/L1    0.142857
 
 ```
 src/
-  main.rs          CLI, model build/load/save orchestration
+  main.rs          CLI (build / emit subcommands), orchestration
   seq_model.rs     GC binning, k-mer model, GC transition model, emit()
   repeat_model.rs  TE and simple repeat profiling from annotation files
   evolve.rs        Mutation operators, evolveRepeat, evolveSimple, bombardment loops
@@ -388,7 +423,7 @@ All sequences are written to a single FASTA file.  When `num_seqs > 1` each reco
 
 | Aspect | Perl GARLIC | `rusted-garlic` |
 |---|---|---|
-| Entry points | Two scripts: `createModel.pl` (build) and `createFakeSequence.pl` (emit) | Single binary — build and/or emit in one invocation |
+| Entry points | Two scripts: `createModel.pl` (build) and `createFakeSequence.pl` (emit) | Single binary with `build` and `emit` subcommands |
 | Model format | Multiple text sidecar files (`.kmer`, `.gc`, `.transition`, …) | Single compact JSON file; two Perl-compatible sidecar files (`.repeats.W1000.data`, `.inserts.W1000.data`) are also written when `--repeats` is provided |
 | Genome data download | `createModel.pl` can auto-fetch annotation files from UCSC | Not supported — provide files explicitly |
 | Gzip support | Manual decompression required | All input files auto-detected and decompressed transparently |

@@ -512,7 +512,7 @@ pub fn insert_te_repeats(
     rng: &mut impl Rng,
 ) -> Vec<InsertRecord> {
     let target_frac = te_frac.unwrap_or_else(|| rng.gen_range(10.0f64..60.0));
-    eprintln!("  => inserting {:.1}% TE elements", target_frac);
+    log::info!("  => inserting {:.1}% TE elements", target_frac);
 
     let mut records: Vec<InsertRecord> = Vec::new();
     let mut repeat_bases: usize = 0;
@@ -606,7 +606,7 @@ pub fn insert_simple_repeats(
     rng: &mut impl Rng,
 ) -> Vec<InsertRecord> {
     let target_frac = sim_frac.unwrap_or_else(|| rng.gen_range(0.0f64..2.0));
-    eprintln!("  => inserting {:.1}% low complexity sequences", target_frac);
+    log::info!("  => inserting {:.1}% low complexity sequences", target_frac);
 
     let mut records: Vec<InsertRecord> = Vec::new();
     let mut repeat_bases: usize = 0;

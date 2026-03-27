@@ -6,6 +6,7 @@ pub mod repeat_model;
 pub mod seq_model;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use log::{error, info, warn};
 use masking::MaskSet;
 use seq_model::{EmitConfig, ModelConfig, SeqModel};
 use std::fs::File;
@@ -16,6 +17,30 @@ use std::path::{Path, PathBuf};
 // Top-level CLI
 // ---------------------------------------------------------------------------
 
+#[derive(ValueEnum, Debug, Clone, Default)]
+enum LogLevel {
+    Error,
+    Warn,
+    #[default]
+    Info,
+    Debug,
+    Trace,
+    Off,
+}
+
+impl LogLevel {
+    fn as_str(&self) -> &'static str {
+        match self {
+            LogLevel::Error => "error",
+            LogLevel::Warn  => "warn",
+            LogLevel::Info  => "info",
+            LogLevel::Debug => "debug",
+            LogLevel::Trace => "trace",
+            LogLevel::Off   => "off",
+        }
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(
     name = "rusted_garlic",
@@ -25,6 +50,10 @@ use std::path::{Path, PathBuf};
              developed by Juan Caballero and G. Glusman (https://doi.org/10.1093/nar/gku356)."
 )]
 struct Cli {
+    /// Log verbosity level (overridden by RUST_LOG if set)
+    #[arg(long = "log-level", global = true, default_value = "info", value_name = "LEVEL")]
+    log_level: LogLevel,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -221,7 +250,7 @@ fn parse_size(s: &str) -> Result<usize, String> {
 }
 
 fn die(msg: &str) -> ! {
-    eprintln!("error: {}", msg);
+    error!("{}", msg);
     std::process::exit(1);
 }
 
@@ -244,10 +273,10 @@ fn run_build(args: BuildArgs) {
         num_gc_bins: args.num_gc_bins,
     };
 
-    eprintln!("Building model from {:?}...", args.in_seq);
+    info!("Building model from {:?}...", args.in_seq);
     let m = SeqModel::model(&args.in_seq, Some(&config));
 
-    eprintln!("Saving model to {:?}...", args.model);
+    info!("Saving model to {:?}...", args.model);
     m.to_file(&args.model);
 
     if m.repeat_model.is_some() {
@@ -256,9 +285,9 @@ fn run_build(args: BuildArgs) {
         let stem = args.model.with_extension("");
         let rep_path = stem.with_extension("repeats.W1000.data");
         let ins_path = stem.with_extension("inserts.W1000.data");
-        eprintln!("Writing repeat profile to {:?}...", rep_path);
+        info!("Writing repeat profile to {:?}...", rep_path);
         repeat_model::write_repeats_file(&rep_path, rm, &gc_strs);
-        eprintln!("Writing insert table to {:?}...", ins_path);
+        info!("Writing insert table to {:?}...", ins_path);
         repeat_model::write_inserts_file(&ins_path, rm, &gc_strs);
     }
 }
@@ -285,8 +314,8 @@ fn run_emit(args: EmitArgs) {
                 }
                 if args.insert_mode == InsertMode::Coverage && args.te_frac.is_none() {
                     // te_frac has a random default — only warn, don't die
-                    eprintln!(
-                        "note: --te_frac not set; coverage mode will use a random target (10–60%)"
+                    warn!(
+                        "--te_frac not set; coverage mode will use a random target (10–60%)"
                     );
                 }
             }
@@ -302,7 +331,7 @@ fn run_emit(args: EmitArgs) {
     }
 
     // --- Load model ---------------------------------------------------------
-    eprintln!("Loading model from {:?}...", args.model);
+    info!("Loading model from {:?}...", args.model);
     let model = SeqModel::from_file(&args.model).unwrap_or_else(|e| {
         die(&format!("could not load model: {}", e));
     });
@@ -315,10 +344,10 @@ fn run_emit(args: EmitArgs) {
 
     // --- Load legacy TE consensus if provided --------------------------------
     let consensus_map = args.te_cons.as_deref().map(|path| {
-        eprintln!("Loading TE consensus sequences from {:?}...", path);
+        info!("Loading TE consensus sequences from {:?}...", path);
         let mut rng = rand::thread_rng();
         let map = consensus::load_fasta(path, &mut rng);
-        eprintln!("  {} consensus sequences loaded", map.len());
+        info!("  {} consensus sequences loaded", map.len());
         map
     });
 
@@ -348,13 +377,13 @@ fn run_emit(args: EmitArgs) {
         };
 
         if num_seqs > 1 {
-            eprintln!("Generating sequence {}/{}...", seq_idx + 1, num_seqs);
+            info!("Generating sequence {}/{}...", seq_idx + 1, num_seqs);
         } else {
-            eprintln!("Generating sequence...");
+            info!("Generating sequence...");
         }
 
         let (seq, records) = model.emit(seq_size, Some(&emit_cfg));
-        eprintln!("Writing {} bp ({})...", seq.len(), seq_name);
+        info!("Writing {} bp ({})...", seq.len(), seq_name);
 
         writeln!(fasta_writer, ">{}", seq_name).expect("Write error");
         for chunk in seq.as_bytes().chunks(60) {
@@ -373,7 +402,7 @@ fn run_emit(args: EmitArgs) {
             }
         }
     }
-    eprintln!("Done. Wrote {} sequence(s) to {:?}", num_seqs, args.out_seq);
+    info!("Done. Wrote {} sequence(s) to {:?}", num_seqs, args.out_seq);
 }
 
 // ---------------------------------------------------------------------------
@@ -382,6 +411,19 @@ fn run_emit(args: EmitArgs) {
 
 fn main() {
     let cli = Cli::parse();
+
+    env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or(cli.log_level.as_str()),
+    )
+    .format(|buf, record| {
+        use std::io::Write;
+        match record.level() {
+            log::Level::Info => writeln!(buf, "{}", record.args()),
+            _ => writeln!(buf, "{}: {}", record.level().as_str().to_lowercase(), record.args()),
+        }
+    })
+    .init();
+
     match cli.command {
         Commands::Build(args) => run_build(args),
         Commands::Emit(args) => run_emit(args),
@@ -404,34 +446,34 @@ fn build_mask(
     let mut mask = MaskSet::new();
 
     if let Some(path) = repeats {
-        eprintln!("Loading repeat annotations from {:?}...", path);
+        info!("Loading repeat annotations from {:?}...", path);
         let intervals = io::align::parse(path);
-        eprintln!(
+        info!(
             "  {} masked intervals loaded",
             intervals.values().map(|v| v.len()).sum::<usize>()
         );
         mask.add(intervals);
     }
     if let Some(path) = trf {
-        eprintln!("Loading TRF annotations from {:?}...", path);
+        info!("Loading TRF annotations from {:?}...", path);
         let intervals = io::bed::parse_trf(path);
-        eprintln!(
+        info!(
             "  {} masked intervals loaded",
             intervals.values().map(|v| v.len()).sum::<usize>()
         );
         mask.add(intervals);
     }
     if let Some(path) = genes {
-        eprintln!("Loading gene annotations from {:?}...", path);
+        info!("Loading gene annotations from {:?}...", path);
         let intervals = io::bed::parse_gene_table(path);
-        eprintln!(
+        info!(
             "  {} masked intervals loaded",
             intervals.values().map(|v| v.len()).sum::<usize>()
         );
         mask.add(intervals);
     }
 
-    eprintln!(
+    info!(
         "Total mask: {} intervals across all sequences",
         mask.interval_count()
     );

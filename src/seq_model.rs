@@ -251,8 +251,8 @@ impl SeqModel {
                     );
                     all_records.extend(recs);
                 } else {
-                    eprintln!("warning: --te_cons provided but the model has no TE repeat records.");
-                    eprintln!("         Rebuild the model with --repeats <align_file> to enable TE insertion.");
+                    log::warn!("--te_cons provided but the model has no TE repeat records; \
+                                rebuild with --repeats <align_file> to enable TE insertion");
                 }
             }
             if sim_total > 0 {
@@ -267,8 +267,8 @@ impl SeqModel {
                 );
                 all_records.extend(recs);
             } else if cfg.sim_frac.is_some() {
-                eprintln!("warning: --sim_frac provided but the model has no simple repeat records.");
-                eprintln!("         Rebuild the model with --trf <bed_file> to enable simple repeat insertion.");
+                log::warn!("--sim_frac provided but the model has no simple repeat records; \
+                            rebuild with --trf <bed_file> to enable simple repeat insertion");
             }
         }
 
@@ -1030,15 +1030,15 @@ impl SeqModel {
             if cfg.repeat_file.is_some() || cfg.trf_file.is_some() {
                 let mut rm = RepeatModel::new(actual_bins);
                 if let Some(rpath) = cfg.repeat_file {
-                    eprintln!("  Profiling repeats from {:?}...", rpath);
+                    log::info!("  Profiling repeats from {:?}...", rpath);
                     profile_rm_align(rpath, &chrom_gc_bins, win_size as u32,
                                      actual_bins, &mut rm);
-                    eprintln!("  {} TE records profiled", rm.te_count());
+                    log::info!("  {} TE records profiled", rm.te_count());
                 }
                 if let Some(tpath) = cfg.trf_file {
-                    eprintln!("  Profiling simple repeats from {:?}...", tpath);
+                    log::info!("  Profiling simple repeats from {:?}...", tpath);
                     profile_trf(tpath, &chrom_gc_bins, win_size as u32, &mut rm);
-                    eprintln!("  {} simple repeat records profiled", rm.simple_count());
+                    log::info!("  {} simple repeat records profiled", rm.simple_count());
                 }
                 seq_model.repeat_model = Some(rm);
             }
@@ -1072,7 +1072,7 @@ impl SeqModel {
             for (_kmer, count) in kmer_bin.iter() {
                 bin_word_count += count;
             }
-            eprintln!("BIN_WORDS bin={} gc={:.1}-{:.1} words={}",
+            log::debug!("BIN_WORDS bin={} gc={:.1}-{:.1} words={}",
                 bin_idx,
                 seq_model.gc_ranges[bin_idx].start as f64 / 10.0,
                 seq_model.gc_ranges[bin_idx].end as f64 / 10.0,
