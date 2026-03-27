@@ -1,0 +1,16 @@
+[package]
+name = "rusted-garlic"
+authors = ["Juan Caballero","Gwenlyn Glusman", "Robert Hubley"]
+description = "Generate realistic artificial DNA sequences"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+itertools = "0.10.5"
+rand = "0.8.5"
+clap = { version = "4.4.6", features = ["derive"] }
+serde = { version = "1.0.159" , features = ["derive"] }
+serde_json = "1.0.93"
+flate2 = "1"
