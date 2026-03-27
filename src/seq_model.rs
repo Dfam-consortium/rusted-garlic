@@ -14,7 +14,7 @@ use serde_json::json;
 use std::error::Error;
 
 use crate::masking::MaskSet;
-use crate::repeat_model::{profile_rm_align, profile_trf, RepeatModel};
+use crate::repeat_model::{profile_repeats, profile_trf, RepeatModel};
 use crate::evolve::{insert_te_repeats, insert_simple_repeats, InsertRecord};
 
 /// Configuration for `SeqModel::emit()` controlling repeat bombardment.
@@ -1031,7 +1031,7 @@ impl SeqModel {
                 let mut rm = RepeatModel::new(actual_bins);
                 if let Some(rpath) = cfg.repeat_file {
                     log::info!("  Profiling repeats from {:?}...", rpath);
-                    profile_rm_align(rpath, &chrom_gc_bins, win_size as u32,
+                    profile_repeats(rpath, &chrom_gc_bins, win_size as u32,
                                      actual_bins, &mut rm);
                     log::info!("  {} TE records profiled", rm.te_count());
                 }

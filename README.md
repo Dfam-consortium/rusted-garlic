@@ -37,7 +37,7 @@ All dependencies are declared in `Cargo.toml` and fetched automatically by Cargo
 
 ## Quick start
 
-`rusted-garlic` has two subcommands: `build` (create a model from a genome) and `emit` (generate sequences from a model).
+`rusted-garlic` has three subcommands: `build` (create a model from a genome), `emit` (generate sequences from a model), and `complexity` (compute sequence complexity measures over sliding windows).
 
 ### 1. Build a model from a genome FASTA
 
@@ -81,19 +81,29 @@ The sequences are named `artificial_sequence_1`, `artificial_sequence_2`, … `a
 
 This is the intended high-fidelity workflow for genome benchmark data.
 
-### Step 1 — Obtain annotation files
+### Step 1 — Obtain and prepare annotation files
 
 You need:
 
 | File | Description |
 |---|---|
 | `genome.fa[.gz]` | Reference genome FASTA |
-| `genome.fa.align[.gz]` | RepeatMasker `.align` output |
+| `genome.repeats.tsv[.gz]` | Interspersed repeat annotations (see below) |
 | `genome.trf.bed[.gz]` | UCSC TRF BED file (0-based half-open) |
 | `refGene.txt[.gz]` | UCSC refGene/ensGene table |
 | `RepeatMaskerLib.fa[.gz]` | TE consensus FASTA (from RepBase / Dfam) |
 
 All input files are auto-detected as gzip-compressed when their name ends in `.gz` and are decompressed transparently — no manual `gunzip` required.
+
+**Preparing the repeat TSV from RepeatMasker output:**
+
+`--repeats` expects a 12-column tab-separated file (see [Repeat TSV format](#repeat-tsv-format) below).  Use the provided converter to produce it from a RepeatMasker `.align` file:
+
+```bash
+python3 utils/rm_align_to_tsv.py genome.fa.align > genome.repeats.tsv
+# or directly from a gzip-compressed file:
+python3 utils/rm_align_to_tsv.py genome.fa.align.gz > genome.repeats.tsv
+```
 
 ### Step 2 — Build a masked model with repeat profiling
 
@@ -101,14 +111,14 @@ All input files are auto-detected as gzip-compressed when their name ends in `.g
 rusted-garlic build \
   --in_seq    genome.fa \
   --model     genome.model \
-  --repeats   genome.fa.align \
+  --repeats   genome.repeats.tsv \
   --trf       genome.trf.bed \
   --genes     refGene.txt
 ```
 
 What each masking flag does:
 
-- `--repeats` — masks interspersed repeats (from RepeatMasker `.align` or `.out`) before k-mer counting; also profiles TE divergence/insertion/deletion rates per GC bin
+- `--repeats` — masks interspersed repeats before k-mer counting; also profiles TE divergence/insertion/deletion rates per GC bin
 - `--trf` — masks simple/tandem repeats before k-mer counting; also profiles simple repeat units and rates per GC bin
 - `--genes` — masks gene bodies before k-mer counting (no repeat profiling)
 
@@ -162,7 +172,7 @@ rusted-garlic build --in_seq <FASTA_FILE> --model <MODEL_FILE> [OPTIONS]
 
 | Flag | Description |
 |---|---|
-| `-r, --repeats <ALIGN_FILE>` | RepeatMasker `.align` or `.out` for masking + TE profiling |
+| `-r, --repeats <TSV_FILE>` | Repeat annotation TSV for masking + TE profiling (see [Repeat TSV format](#repeat-tsv-format)) |
 | `-t, --trf <BED_FILE>` | UCSC TRF BED for masking + simple repeat profiling |
 | `-g, --genes <GENE_FILE>` | UCSC refGene/ensGene table for gene-body masking |
 
@@ -226,6 +236,93 @@ rusted-garlic emit --model <MODEL_FILE> --out_seq <FASTA_FILE> [OPTIONS]
 | `full` | — | `--spacing` | Insert every feature in the FASTA exactly once |
 | `evenly-spaced` | `--spacing` | `--seq_size`, `--allow_nesting` | Place features in order with exactly `--spacing` bp of background between each; output length is determined by the feature set |
 
+### `complexity` subcommand
+
+```
+rusted-garlic complexity [OPTIONS] <FASTA_FILE> [<FASTA_FILE> ...]
+```
+
+Computes a suite of composition and complexity measures for every sliding window across one or more FASTA files.  Output is a tab-separated table written to stdout (or `--out`) with one row per window.
+
+**Inputs**
+
+| Argument | Description |
+|---|---|
+| `<FASTA_FILE> …` | One or more FASTA files (plain or `.gz`); each sequence is processed independently |
+
+**Windowing**
+
+| Flag | Default | Description |
+|---|---|---|
+| `-w, --win <INT>` | sequence length | Window size in bp; omit to treat each sequence as one window |
+| `-s, --step <INT>` | `--win` | Step between window starts; defaults to `--win` (non-overlapping); set smaller for overlapping windows |
+| `-n, --nmax <FLOAT>` | `0.3` | Skip windows where the non-ACGT fraction exceeds this threshold |
+
+**K-mer sizes**
+
+| Flag | Default | Description |
+|---|---|---|
+| `--min_kmer <INT>` | `1` | Smallest k-mer word size to include in k-mer measures (1–6) |
+| `--max_kmer <INT>` | `6` | Largest k-mer word size to include in k-mer measures (1–6) |
+
+**Output**
+
+| Flag | Default | Description |
+|---|---|---|
+| `-o, --out <FILE>` | stdout | Write TSV here instead of stdout |
+
+#### Output columns
+
+The first six columns identify the window; the remainder are measures:
+
+| Column | Description |
+|---|---|
+| `file` | Source FASTA filename |
+| `seq` | Sequence (record) name |
+| `start` | 0-based start position |
+| `end` | 0-based end position (exclusive) |
+| `win_len` | Window length in bp |
+| `acgt_count` | Number of ACGT bases (non-ACGT excluded from denominators) |
+| `gc` | GC content: (C+G) / total |
+| `at` | AT content: (A+T) / total |
+| `gcs` | GC skew: \|G−C\| / (G+C) |
+| `ats` | AT skew: \|A−T\| / (A+T) |
+| `cpg` | CpG ratio: observed CG dinucleotides / (C_count × G_count) |
+| `ket` | Keto skew: \|(G+T)−(A+C)\| / total |
+| `pur` | Purine skew: \|(G+A)−(T+C)\| / total |
+| `cwf` | Wootton-Federhen complexity |
+| `ce` | Shannon entropy (bits) |
+| `cz` | Compression ratio (raw length / gzip length); higher = more repetitive |
+| `cm<k>` | Markov complexity at word size k (one column per k in min_kmer..=max_kmer) |
+| `ct<k>` | Trifonov complexity at word size k |
+| `cl<k>` | Linguistic complexity at word size k |
+
+#### Examples
+
+Whole-sequence measures for every record in a FASTA:
+
+```bash
+rusted-garlic complexity genome.fa > genome.complexity.tsv
+```
+
+Sliding 1 kb windows, 500 bp step, skipping windows with > 10% non-ACGT:
+
+```bash
+rusted-garlic complexity --win 1000 --step 500 --nmax 0.1 chr22.fa > chr22.W1000.tsv
+```
+
+Non-overlapping 500 bp windows, only 2-mers through 4-mers, output to file:
+
+```bash
+rusted-garlic complexity --win 500 --min_kmer 2 --max_kmer 4 --out out.tsv genome.fa
+```
+
+Multiple FASTA files in one run:
+
+```bash
+rusted-garlic complexity --win 1000 chr1.fa chr2.fa chr3.fa > all_chrs.tsv
+```
+
 ---
 
 ## Model file format
@@ -255,6 +352,9 @@ This walks through a realistic small example using chr22.
 # Run RepeatMasker:
 RepeatMasker -pa 16 -species human -align chr22.fa
 
+# Convert .align output to the repeat TSV format:
+python3 utils/rm_align_to_tsv.py chr22.fa.align > chr22.repeats.tsv
+
 # Get TRF BED from UCSC (or run TRF yourself and convert to BED)
 # Get refGene from UCSC Table Browser
 
@@ -268,7 +368,7 @@ RepeatMasker -pa 16 -species human -align chr22.fa
 rusted-garlic build \
   --in_seq  chr22.fa \
   --model   chr22.model \
-  --repeats chr22.fa.align \
+  --repeats chr22.repeats.tsv \
   --trf     chr22.trf.bed \
   --genes   refGene.txt
 ```
@@ -326,7 +426,7 @@ To use 5-mers and 500 bp windows (e.g. for a GC-rich or compact genome):
 rusted-garlic build \
   --in_seq      chr22.fa \
   --model       chr22_k5w500.model \
-  --repeats     chr22.fa.align \
+  --repeats     chr22.repeats.tsv \
   --trf         chr22.trf.bed \
   --genes       refGene.txt \
   --kmer_size   5 \
@@ -361,6 +461,49 @@ print(f'Repeat: {lc} bp  ({100*lc/total:.1f}%)')
 
 ---
 
+## Repeat TSV format
+
+The `--repeats` flag accepts a 12-column tab-separated file with 0-based half-open coordinates (BED convention).  Lines beginning with `#` are treated as comments.
+
+| Col | Name | Description |
+|---|---|---|
+| 0 | `chrom` | Sequence / chromosome name |
+| 1 | `start` | 0-based half-open start |
+| 2 | `end` | 0-based half-open end |
+| 3 | `name` | Repeat name (e.g. `AluYa5`) |
+| 4 | `family` | Class/family string (e.g. `SINE/Alu`) |
+| 5 | `strand` | `+` or `-` |
+| 6 | `div` | % substitution divergence |
+| 7 | `ins` | % insertion rate |
+| 8 | `del` | % deletion rate |
+| 9 | `cons_start` | Consensus start coordinate |
+| 10 | `cons_end` | Consensus end coordinate |
+| 11 | `rep_id` | Unique instance ID (use `.` if not available) |
+
+`rep_id` serves two purposes: it ties multiple fragments of the same repeat instance together (so divergence stats are taken as the max across all fragments), and it enables nested-insertion detection (elements appearing between two occurrences of the same `rep_id` in the file are recorded as nested inside that repeat).  Use `.` when the source data does not track instance identity; each row is then treated as an independent unfragmented element and nesting is not recorded.
+
+Simple/tandem repeats must be excluded from this file — they are handled separately by `--trf`.
+
+**Example rows:**
+```
+#chrom	start	end	name	family	strand	div	ins	del	cons_start	cons_end	rep_id
+chr22	999	1306	AluYa5	SINE/Alu	+	12.40	0.60	1.20	1	308	m_b1s502i1
+chr22	5000	5312	L1HS	LINE/L1	-	18.20	1.10	0.80	1	312	m_b2s001i3
+```
+
+### Converting from RepeatMasker
+
+`utils/rm_align_to_tsv.py` converts a RepeatMasker `.align` file to this format:
+
+```bash
+python3 utils/rm_align_to_tsv.py genome.fa.align    > genome.repeats.tsv
+python3 utils/rm_align_to_tsv.py genome.fa.align.gz > genome.repeats.tsv
+```
+
+The script filters out Simple_repeat, Low_complexity, Unknown, and Satellite entries and handles both positive- and negative-strand `.align` header layouts.
+
+---
+
 ## Sidecar files
 
 When `build` is run with `--repeats`, two text files are written alongside the model that are compatible with the original Perl `createFakeSequence.pl`.  The filenames always use the `W1000` suffix for Perl compatibility regardless of `--win_size`:
@@ -385,15 +528,17 @@ AluSx#SINE/Alu    L1HS#LINE/L1    0.142857
 
 ```
 src/
-  main.rs          CLI (build / emit subcommands), orchestration
+  main.rs          CLI (build / emit / complexity subcommands), orchestration
   seq_model.rs     GC binning, k-mer model, GC transition model, emit()
   repeat_model.rs  TE and simple repeat profiling from annotation files
   evolve.rs        Mutation operators, evolveRepeat, evolveSimple, bombardment loops
   consensus.rs     FASTA consensus loader with IUPAC resolution
   masking.rs       MaskSet and MaskCursor (streaming interval checker)
+  complexity.rs    WindowCounts accumulator and all 12 complexity measures
   io/
     mod.rs         IntervalMap type, sort_and_merge helper
-    align.rs       RepeatMasker .align / .out parser
+    fasta.rs       Streaming FASTA iterator (plain + gz)
+    repeats.rs     12-column repeat TSV parser
     bed.rs         TRF BED and UCSC gene-table parsers
 ```
 
@@ -424,6 +569,7 @@ All sequences are written to a single FASTA file.  When `num_seqs > 1` each reco
 | Aspect | Perl GARLIC | `rusted-garlic` |
 |---|---|---|
 | Entry points | Two scripts: `createModel.pl` (build) and `createFakeSequence.pl` (emit) | Single binary with `build` and `emit` subcommands |
+| Repeat input format | RepeatMasker `.align` / `.out` parsed directly | Generic 12-column TSV (convert with `utils/rm_align_to_tsv.py`) |
 | Model format | Multiple text sidecar files (`.kmer`, `.gc`, `.transition`, …) | Single compact JSON file; two Perl-compatible sidecar files (`.repeats.W1000.data`, `.inserts.W1000.data`) are also written when `--repeats` is provided |
 | Genome data download | `createModel.pl` can auto-fetch annotation files from UCSC | Not supported — provide files explicitly |
 | Gzip support | Manual decompression required | All input files auto-detected and decompressed transparently |
@@ -470,6 +616,14 @@ During repeat profiling (Pass 3), each annotated repeat is assigned to a GC bin 
 
 - **Perl**: uses the repeat's start coordinate to look up the GC bin.
 - **Rust**: uses the midpoint `(start + end) / 2` of the repeat, which is more representative for long elements that may span a GC bin boundary.
+
+### Features in `rusted-garlic` not present in Perl GARLIC
+
+| Feature | Description |
+|---|---|
+| `complexity` subcommand | Ports the separate `SeqComplexity.pm` / `gatherStats.pl` workflow into the binary; computes all 12 sequence complexity measures (composition, entropy, k-mer diversity, compression) over sliding windows with a single command |
+| Streaming FASTA reader | Processes arbitrarily large FASTA files without loading them into memory |
+| In-process gzip compression | `cz` measure uses `flate2` in-process rather than shelling out to `gzip` with temp files |
 
 ### Features present in Perl GARLIC not yet in `rusted-garlic`
 

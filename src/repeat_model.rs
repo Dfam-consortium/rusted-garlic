@@ -91,14 +91,18 @@ pub fn get_gc_bin(
 }
 
 // ---------------------------------------------------------------------------
-// RM .align profiler
+// Repeat TSV profiler
 // ---------------------------------------------------------------------------
 
-/// Parse a RepeatMasker `.align` (or `.out`) file and populate `model` with
+/// Parse a rusted-garlic repeat annotation TSV and populate `model` with
 /// TE repeat records and the nested-insert table.
 ///
-/// Mirrors Perl's `profileRMAlign`.
-pub fn profile_rm_align(
+/// Expected columns (tab-separated, 0-based half-open coordinates):
+///   chrom  start  end  name  family  strand  div  ins  del  cons_start  cons_end  rep_id
+///
+/// When `rep_id` is `.` each row is treated as an independent unfragmented
+/// element (no fragment assembly, no nesting detection).
+pub fn profile_repeats(
     path: impl AsRef<Path>,
     chrom_gc_bins: &HashMap<String, Vec<u32>>,
     win_size: u32,
@@ -107,110 +111,87 @@ pub fn profile_rm_align(
 ) {
     let reader = crate::io::open_reader(path.as_ref());
 
-    // `repdata`: accumulates per-repeat-ID data while streaming.
-    // Key: repeat ID string (last field of .align line, e.g. "m_b1s502i1")
-    // Value: accumulated record
+    // Accumulates per-instance data while streaming.
+    // Key: rep_id; value: accumulated record built from one or more fragments.
     struct RepData {
-        label: String,  // semicolon-joined fragment params
-        ini: u32,       // earliest genomic start
-        end: u32,       // latest genomic end
+        label: String,    // semicolon-joined fragment params
+        ini: u32,         // earliest genomic start (0-based)
+        end: u32,         // latest genomic end (0-based half-open)
         seq_id: String,
-        type_fam: String, // "AluYa5#SINE/Alu"
+        type_fam: String, // "name#family"
     }
     let mut repdata: HashMap<String, RepData> = HashMap::new();
 
-    // For nested-insert detection we need to track the type#family seen at
-    // each line number, and the last line where each repeat ID appeared.
-    let mut line_rep_name: Vec<Option<String>> = Vec::new(); // index = line number
-    let mut id_hash: HashMap<String, usize> = HashMap::new(); // rep_id -> line number
+    // For nested-insert detection: track the type#family at each data-row
+    // index, and the last row index where each rep_id appeared.
+    let mut row_rep_name: Vec<Option<String>> = Vec::new();
+    let mut id_last_row: HashMap<String, usize> = HashMap::new();
 
     // Temporary insert counts: [gc_bin][outer][inner] = count
     let mut insert_counts: Vec<HashMap<String, HashMap<String, u32>>> =
         vec![HashMap::new(); num_bins];
 
-    let mut line_num: usize = 0;
+    let mut row_idx: usize = 0;
 
     for raw in reader.lines() {
-        let line = raw.expect("Read error");
-        line_num += 1;
-        line_rep_name.push(None);
-
-        let trimmed = line.trim_start();
-        if !looks_like_data_line(trimmed) {
-            continue;
-        }
-        if trimmed.contains("Simple_repeat")
-            || trimmed.contains("Low_complexity")
-            || trimmed.contains("Unknown")
-            || trimmed.contains("Satellite")
-        {
+        let line = raw.expect("Read error in repeat TSV");
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
 
-        let f: Vec<&str> = trimmed.split_ascii_whitespace().collect();
-        // Two variants of the .align header line:
-        //   Positive strand (13 fields):  ... (left)  name#fam  rbegin  rend  (rleft)  id
-        //   Negative strand (14 fields):  ... (left)  C  name#fam  (rleft)  rend  rbegin  id
-        // Both need at least 13 fields.
-        if f.len() < 13 {
+        row_rep_name.push(None);
+        let cur_row = row_idx;
+        row_idx += 1;
+
+        let f: Vec<&str> = trimmed.split('\t').collect();
+        if f.len() < 12 {
             continue;
         }
 
-        let div: f64 = f[1].parse().unwrap_or(0.0);
-        let ins: f64 = f[2].parse().unwrap_or(0.0);
-        let del: f64 = f[3].parse().unwrap_or(0.0);
-        let seq_id = f[4];
-        let ini: u32 = f[5].parse().unwrap_or(0);
-        let end: u32 = f[6].parse().unwrap_or(0);
+        let seq_id    = f[0];
+        let ini: u32  = f[1].parse().unwrap_or(0);  // 0-based half-open start
+        let end: u32  = f[2].parse().unwrap_or(0);  // 0-based half-open end
+        let name      = f[3];
+        let family    = f[4];
+        let dir       = f[5].chars().next().unwrap_or('+');
+        let div: f64  = f[6].parse().unwrap_or(0.0);
+        let ins: f64  = f[7].parse().unwrap_or(0.0);
+        let del: f64  = f[8].parse().unwrap_or(0.0);
+        let rini: u32 = f[9].parse().unwrap_or(0);
+        let rend: u32 = f[10].parse().unwrap_or(0);
+        let rep_id    = f[11];
 
-        // Parse strand + name + family + consensus coords.
-        //
-        // RepeatMasker .align header format:
-        //   Positive strand (13 fields):
-        //     score div del ins seqid begin end (left)  name#fam  rbegin rend (rleft) id
-        //     [0]   [1] [2] [3]  [4]  [5]  [6]   [7]     [8]      [9]  [10]   [11]  [12]
-        //
-        //   Negative strand (14 fields) — 'C' is inserted at [8], coords reversed:
-        //     score div del ins seqid begin end (left) C name#fam (rleft) rend rbegin id
-        //     [0]   [1] [2] [3]  [4]  [5]  [6]   [7] [8]  [9]    [10]  [11]  [12]  [13]
-        //
-        // Note: positive strand has no explicit strand character; 'C' marks negative.
-        let (dir, type_str, fam_str, rini, rend) = if f[8] == "C" {
-            // Negative strand — need at least 14 fields
-            if f.len() < 14 { continue; }
-            let (t, fa) = split_name_fam(f[9]);
-            // f[10] = (rleft) [parenthesized, parse fails → ignored]
-            let ri: u32 = f[12].parse().unwrap_or(0); // rbegin (leftmost in consensus)
-            let re: u32 = f[11].parse().unwrap_or(0); // rend   (rightmost in consensus)
-            ('-', t, fa, ri, re)
-        } else {
-            // Positive strand — name#fam is at [8], no explicit strand character
-            let (t, fa) = split_name_fam(f[8]);
-            let ri: u32 = f[9].parse().unwrap_or(0);  // rbegin
-            let re: u32 = f[10].parse().unwrap_or(0); // rend
-            ('+', t, fa, ri, re)
-        };
-
-        let type_fam = format!("{}#{}", type_str, fam_str);
-        let rep_id = f[f.len() - 1].to_string();
+        let type_fam = format!("{}#{}", name, family);
         let fragment_label = format!(
             "{}:{}:{}:{:.2}:{:.2}:{:.2}:{}:{}",
-            type_str, fam_str, dir, div, ins, del, rini, rend
+            name, family, dir, div, ins, del, rini, rend
         );
 
-        // Update the name at this line for nested-insert tracking
-        line_rep_name[line_num - 1] = Some(type_fam.clone());
+        row_rep_name[cur_row] = Some(type_fam.clone());
 
-        // Nested insert detection: if we've seen this rep_id before, the lines
-        // between the two occurrences are elements inserted inside this repeat.
-        if let Some(&prev_line) = id_hash.get(&rep_id) {
-            if let Some(rd) = repdata.get(&rep_id) {
+        // When rep_id is "." treat as independent — no fragment assembly or nesting.
+        if rep_id == "." {
+            let pos = ini + (end.saturating_sub(ini)) / 2;
+            let gc = match get_gc_bin(chrom_gc_bins, seq_id, pos, win_size) {
+                Some(g) => g as usize,
+                None => continue,
+            };
+            if let Some(te) = parse_te_label(&fragment_label) {
+                model.te_profile[gc].push(te);
+            }
+            continue;
+        }
+
+        // Nested insert detection: elements appearing between two occurrences
+        // of the same rep_id are nested inside that repeat.
+        if let Some(&prev_row) = id_last_row.get(rep_id) {
+            if let Some(rd) = repdata.get(rep_id) {
                 let pos = rd.ini + (end.saturating_sub(rd.ini)) / 2;
-                let gc = get_gc_bin(chrom_gc_bins, rd.seq_id.as_str(), pos, win_size);
-                if let Some(gc_bin) = gc {
+                if let Some(gc_bin) = get_gc_bin(chrom_gc_bins, rd.seq_id.as_str(), pos, win_size) {
                     let outer = rd.type_fam.clone();
-                    for ln in (prev_line + 1)..line_num.saturating_sub(1) {
-                        if let Some(Some(inner)) = line_rep_name.get(ln) {
+                    for ln in (prev_row + 1)..cur_row {
+                        if let Some(Some(inner)) = row_rep_name.get(ln) {
                             if !inner.is_empty() {
                                 *insert_counts[gc_bin as usize]
                                     .entry(outer.clone())
@@ -223,11 +204,11 @@ pub fn profile_rm_align(
                 }
             }
         }
-        id_hash.insert(rep_id.clone(), line_num - 1);
+        id_last_row.insert(rep_id.to_string(), cur_row);
 
-        // Accumulate or create repeat record
+        // Accumulate or create the repeat record for this rep_id.
         repdata
-            .entry(rep_id)
+            .entry(rep_id.to_string())
             .and_modify(|rd| {
                 rd.label.push(';');
                 rd.label.push_str(&format!(
@@ -247,7 +228,7 @@ pub fn profile_rm_align(
             });
     }
 
-    // Assign each accumulated repeat to a GC bin and parse into TeRepeat
+    // Assign each accumulated repeat instance to a GC bin.
     for rd in repdata.values() {
         let pos = rd.ini + (rd.end.saturating_sub(rd.ini)) / 2;
         let gc = match get_gc_bin(chrom_gc_bins, &rd.seq_id, pos, win_size) {
@@ -259,7 +240,7 @@ pub fn profile_rm_align(
         }
     }
 
-    // Convert insert counts to frequencies
+    // Convert insert counts to frequencies.
     for (gc_bin, outer_map) in insert_counts.into_iter().enumerate() {
         for (outer, inner_map) in outer_map {
             let total: u32 = inner_map.values().sum();
@@ -312,28 +293,6 @@ fn parse_te_label(label: &str) -> Option<TeRepeat> {
     let length = rend.saturating_sub(rini);
     let nfrg = frags.len() as u32;
     Some(TeRepeat { name, family, dir, div, ins, del, length, nfrg })
-}
-
-/// Split "Name#Class/Family" into (name, family).
-fn split_name_fam(s: &str) -> (&str, &str) {
-    if let Some(idx) = s.find('#') {
-        (&s[..idx], &s[idx + 1..])
-    } else {
-        (s, "Unknown")
-    }
-}
-
-fn looks_like_data_line(s: &str) -> bool {
-    let mut chars = s.chars().peekable();
-    if !chars.peek().map_or(false, |c| c.is_ascii_digit()) {
-        return false;
-    }
-    while chars.peek().map_or(false, |c| c.is_ascii_digit()) { chars.next(); }
-    if !chars.peek().map_or(false, |c| c.is_ascii_whitespace()) { return false; }
-    while chars.peek().map_or(false, |c| c.is_ascii_whitespace()) { chars.next(); }
-    if !chars.peek().map_or(false, |c| c.is_ascii_digit()) { return false; }
-    while chars.peek().map_or(false, |c| c.is_ascii_digit()) { chars.next(); }
-    chars.peek() == Some(&'.')
 }
 
 // ---------------------------------------------------------------------------

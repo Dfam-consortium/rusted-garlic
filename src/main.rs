@@ -1,3 +1,4 @@
+pub mod complexity;
 pub mod consensus;
 pub mod evolve;
 pub mod io;
@@ -64,6 +65,8 @@ enum Commands {
     Build(BuildArgs),
     /// Emit artificial sequence(s) from a saved model
     Emit(EmitArgs),
+    /// Compute sequence complexity and composition measures
+    Complexity(ComplexityArgs),
 }
 
 // ---------------------------------------------------------------------------
@@ -224,6 +227,56 @@ struct EmitArgs {
     /// Write a BED file of inserted repeat locations alongside the sequence
     #[arg(long = "out_bed", value_name = "BED_FILE")]
     out_bed: Option<PathBuf>,
+}
+
+// ---------------------------------------------------------------------------
+// Complexity subcommand
+// ---------------------------------------------------------------------------
+
+#[derive(Args, Debug)]
+#[command(after_help = "\
+Examples:
+  # Whole-sequence measures for every record in a FASTA:
+  rusted-garlic complexity genome.fa
+
+  # Non-overlapping 1 kb windows:
+  rusted-garlic complexity genome.fa --win 1000
+
+  # Sliding windows (500 bp step over 1 kb windows), skip if >10% N:
+  rusted-garlic complexity genome.fa --win 1000 --step 500 --nmax 0.1
+
+  # Multiple files, k-mers 2-4, write to file:
+  rusted-garlic complexity a.fa b.fa --win 1000 --min_kmer 2 --max_kmer 4 --out stats.tsv
+")]
+struct ComplexityArgs {
+    /// Input FASTA file(s) — plain or gzip-compressed
+    #[arg(value_name = "FASTA", required = true)]
+    inputs: Vec<PathBuf>,
+
+    /// Window size in bp [default: full sequence per record]
+    #[arg(short = 'w', long, value_name = "INT")]
+    win: Option<usize>,
+
+    /// Step size in bp [default: window size → non-overlapping]
+    ///   Use a value smaller than --win for sliding (overlapping) windows.
+    #[arg(short = 's', long, value_name = "INT")]
+    step: Option<usize>,
+
+    /// Skip windows where the non-ACGT fraction exceeds this value [default: 0.3]
+    #[arg(long, value_name = "FLOAT", default_value = "0.3")]
+    nmax: f64,
+
+    /// Minimum k-mer word size for cm/ct/cl measures [default: 1]
+    #[arg(long, value_name = "INT", default_value = "1")]
+    min_kmer: usize,
+
+    /// Maximum k-mer word size for cm/ct/cl measures [default: 6]
+    #[arg(long, value_name = "INT", default_value = "6")]
+    max_kmer: usize,
+
+    /// Output TSV file [default: stdout]
+    #[arg(short, long = "out", value_name = "FILE")]
+    out: Option<PathBuf>,
 }
 
 // ---------------------------------------------------------------------------
@@ -427,6 +480,83 @@ fn main() {
     match cli.command {
         Commands::Build(args) => run_build(args),
         Commands::Emit(args) => run_emit(args),
+        Commands::Complexity(args) => run_complexity(args),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Complexity handler
+// ---------------------------------------------------------------------------
+
+fn run_complexity(args: ComplexityArgs) {
+    // Validate k-mer range.
+    if args.min_kmer < 1 || args.max_kmer > 6 || args.min_kmer > args.max_kmer {
+        die("--min_kmer and --max_kmer must satisfy 1 ≤ min_kmer ≤ max_kmer ≤ 6");
+    }
+    if args.nmax < 0.0 || args.nmax > 1.0 {
+        die("--nmax must be between 0.0 and 1.0");
+    }
+
+    let mut writer: Box<dyn std::io::Write> = match &args.out {
+        Some(path) => Box::new(BufWriter::new(
+            File::create(path).unwrap_or_else(|e| {
+                die(&format!("cannot create output file {:?}: {}", path, e))
+            }),
+        )),
+        None => Box::new(BufWriter::new(std::io::stdout())),
+    };
+
+    // Write header.
+    writeln!(writer, "{}", complexity::tsv_header(args.min_kmer, args.max_kmer))
+        .expect("Write error");
+
+    for input_path in &args.inputs {
+        let file_label = input_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("?");
+
+        info!("Processing {:?}...", input_path);
+        let fasta = io::fasta::FastaIter::new(input_path);
+
+        for (seq_name, seq) in fasta {
+            let seq_len = seq.len();
+            if seq_len == 0 {
+                continue;
+            }
+
+            // Determine window and step sizes.
+            let win = args.win.unwrap_or(seq_len).min(seq_len);
+            let step = args.step.unwrap_or(win).max(1);
+
+            let mut start = 0usize;
+            while start + win <= seq_len {
+                let window = &seq[start..start + win];
+
+                // Count non-ACGT fraction quickly before building full counts.
+                let n_frac = window.iter()
+                    .filter(|&&b| !matches!(b, b'A' | b'C' | b'G' | b'T'))
+                    .count() as f64 / win as f64;
+
+                if n_frac <= args.nmax {
+                    let row = complexity::tsv_row(
+                        window,
+                        file_label,
+                        &seq_name,
+                        start,
+                        args.min_kmer,
+                        args.max_kmer,
+                    );
+                    writeln!(writer, "{}", row).expect("Write error");
+                }
+
+                start += step;
+            }
+
+            // If whole-sequence mode (win == seq_len) we're done after one window.
+            // If windowed but the last window doesn't align, we've already stopped.
+        }
+        info!("  done.");
     }
 }
 
@@ -447,7 +577,7 @@ fn build_mask(
 
     if let Some(path) = repeats {
         info!("Loading repeat annotations from {:?}...", path);
-        let intervals = io::align::parse(path);
+        let intervals = io::repeats::parse(path);
         info!(
             "  {} masked intervals loaded",
             intervals.values().map(|v| v.len()).sum::<usize>()

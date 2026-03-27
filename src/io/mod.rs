@@ -1,5 +1,6 @@
-pub mod align;
 pub mod bed;
+pub mod fasta;
+pub mod repeats;
 
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read};
