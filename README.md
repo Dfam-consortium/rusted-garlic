@@ -56,6 +56,9 @@ rusted-garlic build --in_seq genome.fa --model genome.model \
 
 > **Note:** window size, k-mer size, and bin count are embedded in the model file and automatically applied when generating sequences — you do not need to repeat them at emit time.
 
+In this simple case, the sequence model is being trained on the full-genomic sequence including (if present), transposable element sequences, simple/tandem repeats,
+and gene regions.  See the full workflow below to generate true-background sequence models.
+
 ### 2. Generate an artificial sequence from the saved model
 
 ```bash
@@ -63,9 +66,6 @@ rusted-garlic emit --model genome.model --out_seq artificial.fa --seq_size 10m
 ```
 
 `--seq_size` accepts bare integers or the suffixes `k`, `m`, `g` (case-insensitive).  Without `--seq_size` the output is the same length as the input genome.
-
-In this simple case, the sequence model is being trained on the full-genomic sequence including (if present), transposable element sequences, simple/tandem repeats,
-and gene regions.  See the full workflow below to generate true-background sequence models.
 
 ### 2a. Generate multiple sequences in one run
 
@@ -92,8 +92,8 @@ You need:
 |---|---|
 | `genome.fa[.gz]` | Reference genome FASTA |
 | `genome.te_annot.tsv[.gz]` | Interspersed repeat (TE) annotations (see below) |
-| `genome.tandem_annot.tsv[.gz]` | Tandem/simple repeat annotations (0-based half-open BED-like) |
-| `genome.gene_annot.tsv[.gz]` | Gene body annotations (0-based half-open BED-like) |
+| `genome.tandem_annot.tsv[.gz]` | Tandem/simple repeat annotations (UCSC TRF BED format) |
+| `genome.gene_annot.tsv[.gz]` | Gene body + exon annotations (see format below) |
 | `RepeatMaskerLib.fa[.gz]` | TE consensus FASTA (from RepBase / Dfam) |
 
 All input files are auto-detected as gzip-compressed when their name ends in `.gz` and are decompressed transparently — no manual `gunzip` required.
@@ -108,24 +108,47 @@ python3 utils/rm_align_to_tsv.py genome.fa.align > genome.te_annot.tsv
 python3 utils/rm_align_to_tsv.py genome.fa.align.gz > genome.te_annot.tsv
 ```
 
-**Preparing the tandem repeat annotation TSV:**
+**Preparing the tandem repeat annotation file:**
 
-`--tandem_annot` expects a simple 3-column BED-like file (`chrom`, `start`, `end`, 0-based half-open).  Any source of tandem/simple repeat intervals works — UCSC TRF track, self-generated TRF output, or custom annotations — as long as the first three columns follow the standard coordinate convention:
+`--tandem_annot` expects **UCSC TRF BED format** — this is both the masking source and the simulation profile source.  The format requires at minimum 9 tab-separated columns with the literal string `trf` in column 3:
+
+```
+chrom  start  end  trf  score  period  copies  percent_match  percent_indel  ...  consensus
+```
+
+All coordinates are 0-based half-open.  The consensus sequence must be in the last column.  UCSC TRF track downloads are already in this format:
 
 ```bash
 # From a UCSC TRF BED download (already in the right format):
 cp hg38.trf.bed genome.tandem_annot.tsv
-
-# From raw TRF output, a simple awk conversion may be needed to reformat.
 ```
 
-**Preparing the gene annotation TSV:**
+> **Note:** If you supply a file with fewer than 9 columns or without `trf` in column 3, the masking pass will still work (it only needs columns 0–2), but no tandem repeat profile will be built and `--sim_frac` will have no effect.
 
-`--gene_annot` also expects `chrom`, `start`, `end` in the first three columns (0-based half-open).  Any transcript/gene interval source works.  If starting from a UCSC refGene/ensGene table you will need to extract the relevant columns:
+**Preparing the gene annotation file:**
+
+`--gene_annot` uses a 7-column tab-separated format (0-based half-open):
+
+```
+chrom  txStart  txEnd  name  strand  exonStarts  exonEnds
+```
+
+Columns 0–2 are required.  Columns 3–4 (`name`, `strand`) are informational and may be `.`.  Columns 5–6 are comma-separated exon start/end coordinate lists; use `.` when exon coordinates are not available (only gene-body masking will be possible in that case).
+
+The gene annotation serves two purposes:
+1. **Masking** — gene bodies (or exons with `--mask_exon`) are excluded from k-mer counting
+2. **Profiling filter** — TEs and tandem repeats that overlap the masked regions are excluded from their respective profiles (matching Perl's intron filter behavior)
 
 ```bash
-# Extract chrom, txStart, txEnd from a UCSC gene table (already 0-based half-open):
-awk 'NR>1 {print $3"\t"$5"\t"$6}' refGene.txt > genome.gene_annot.tsv
+# From a UCSC refGene table — extract the needed columns:
+awk 'NR>1 {
+    name=$2; chrom=$3; strand=$4; txStart=$5; txEnd=$6;
+    exStarts=$10; exEnds=$11;
+    print chrom"\t"txStart"\t"txEnd"\t"name"\t"strand"\t"exStarts"\t"exEnds
+}' refGene.txt > genome.gene_annot.tsv
+
+# Gene-body only (no exon coordinates needed):
+awk 'NR>1 {print $3"\t"$5"\t"$6"\t"$2"\t"$4"\t.\t."}' refGene.txt > genome.gene_annot.tsv
 ```
 
 ### Step 2 — Build a masked model with repeat profiling
@@ -139,11 +162,12 @@ rusted-garlic build \
   --gene_annot   genome.gene_annot.tsv
 ```
 
-What each masking flag does:
+What each flag does:
 
-- `--te_annot` — masks interspersed repeats before k-mer counting; also profiles TE divergence/insertion/deletion rates per GC bin
-- `--tandem_annot` — masks simple/tandem repeats before k-mer counting; also profiles simple repeat units and rates per GC bin
-- `--gene_annot` — masks gene bodies before k-mer counting (no repeat profiling)
+- `--te_annot` — masks interspersed repeats before k-mer counting; profiles TE divergence/insertion/deletion rates per GC bin; TEs overlapping gene regions are excluded from the profile when `--gene_annot` is provided
+- `--tandem_annot` — masks tandem/simple repeats before k-mer counting; profiles tandem repeat consensus sequences per GC bin; tandem repeats contained within a TE interval *or* overlapping a gene region are excluded from the profile
+- `--gene_annot` — masks gene bodies (default) or exons (`--mask_exon`) before k-mer counting; also acts as a profiling filter for both TE and tandem annotations
+- `--mask_exon` — mask only exon intervals instead of whole gene bodies (requires exon coordinates in `--gene_annot`)
 
 Two Perl-compatible sidecar files are written alongside the model:
 
@@ -196,10 +220,11 @@ rusted-garlic build --in_seq <FASTA_FILE> --model <MODEL_FILE> [OPTIONS]
 | Flag | Description |
 |---|---|
 | `--te_annot <TSV_FILE>` | 12-column TE annotation TSV for masking + TE profiling (see [TE annotation format](#te-annotation-format)) |
-| `--tandem_annot <TSV_FILE>` | 3-column tandem/simple repeat annotation TSV for masking + tandem repeat profiling |
-| `--gene_annot <TSV_FILE>` | 3-column gene body annotation TSV for masking |
+| `--tandem_annot <TSV_FILE>` | UCSC TRF BED file for masking + tandem repeat profiling (see [Annotation file formats](#annotation-file-formats)) |
+| `--gene_annot <TSV_FILE>` | 7-column gene annotation file for masking + profiling filter (see [Annotation file formats](#annotation-file-formats)) |
+| `--mask_exon` | Mask exon intervals only instead of whole gene bodies (requires exon columns in `--gene_annot`) |
 
-All three annotation files use 0-based half-open coordinates.  `--tandem_annot` and `--gene_annot` need only `chrom`, `start`, `end` in the first three columns; any additional columns are ignored.
+All annotation files use 0-based half-open coordinates.  TEs and tandem repeats that overlap gene regions are excluded from their simulation profiles.  Tandem repeats fully contained within a TE interval are also excluded from the tandem profile.
 
 **Model parameters (stored in the model file)**
 
@@ -491,19 +516,47 @@ print(f'Repeat: {lc} bp  ({100*lc/total:.1f}%)')
 
 ## Annotation file formats
 
-All three annotation flags (`--te_annot`, `--tandem_annot`, `--gene_annot`) accept tab- or whitespace-delimited files with 0-based half-open coordinates.  Lines beginning with `#` are treated as comments and skipped.
+All annotation files use 0-based half-open coordinates and may be plain or gzip-compressed.  Lines beginning with `#` are treated as comments and skipped.
 
-### `--tandem_annot` and `--gene_annot` format
+### Tandem repeat annotation format (`--tandem_annot`)
 
-Both flags expect a simple 3-column BED-like file.  Any additional columns are ignored:
+`--tandem_annot` accepts **UCSC TRF BED format**.  This file is used for both masking (columns 0–2 only) and building the tandem repeat simulation profile (columns 0–2 + 3–last).  At minimum 9 whitespace-delimited fields are required; the literal string `trf` must appear in column 3:
 
 | Col | Name | Description |
 |---|---|---|
 | 0 | `chrom` | Sequence / chromosome name |
 | 1 | `start` | 0-based half-open start |
 | 2 | `end` | 0-based half-open end |
+| 3 | `trf` | Literal string `trf` (identifies the format) |
+| 4 | (score) | Ignored |
+| 5 | `period` | Repeat unit period length |
+| 6 | (copies) | Ignored |
+| 7 | `pct_match` | Percent match (used to derive divergence: 100 − pct_match) |
+| 8 | `pct_indel` | Percent indel rate |
+| … | … | Additional columns ignored |
+| last | `consensus` | Tandem repeat consensus sequence |
 
-These are the same first three columns used by standard BED files and UCSC TRF track downloads.
+> If the file has fewer than 9 columns or column 3 is not `trf`, every line will be skipped for profiling (a warning is issued).  Masking still works from columns 0–2.
+
+UCSC TRF track downloads are already in this format and require no conversion.
+
+### Gene annotation format (`--gene_annot`)
+
+`--gene_annot` accepts a 7-column tab-separated file.  Columns 0–2 are required; columns 3–6 are optional but needed for exon-level masking (`--mask_exon`) and the gene profiling filter:
+
+| Col | Name | Description |
+|---|---|---|
+| 0 | `chrom` | Sequence / chromosome name |
+| 1 | `txStart` | Gene body 0-based start |
+| 2 | `txEnd` | Gene body 0-based end (exclusive) |
+| 3 | `name` | Gene/transcript name — informational, may be `.` |
+| 4 | `strand` | `+` or `-` — informational, may be `.` |
+| 5 | `exonStarts` | Comma-separated 0-based exon start positions; `.` if not available |
+| 6 | `exonEnds` | Comma-separated 0-based exon end positions (exclusive); `.` if not available |
+
+The gene annotation serves two roles:
+1. **Masking** — gene bodies (default) or exon intervals (`--mask_exon`) are excluded from k-mer counting
+2. **Profiling filter** — TE instances and tandem repeats that overlap the masked gene regions are excluded from their respective simulation profiles
 
 ### TE annotation format (`--te_annot`) {#te-annotation-format}
 
@@ -613,7 +666,7 @@ All sequences are written to a single FASTA file.  When `num_seqs > 1` each reco
 | Aspect | Perl GARLIC | `rusted-garlic` |
 |---|---|---|
 | Entry points | Two scripts: `createModel.pl` (build) and `createFakeSequence.pl` (emit) | Single binary with `build` and `emit` subcommands |
-| Repeat input format | RepeatMasker `.align` / `.out` parsed directly | Generic 12-column TSV via `--te_annot` (convert with `utils/rm_align_to_tsv.py`); tandem and gene intervals via `--tandem_annot` / `--gene_annot` as simple 3-column BED-like files |
+| Repeat input format | RepeatMasker `.align` / `.out` parsed directly | 12-column TSV via `--te_annot` (convert with `utils/rm_align_to_tsv.py`); UCSC TRF BED via `--tandem_annot`; 7-column gene annotation via `--gene_annot` |
 | Model format | Multiple text sidecar files (`.kmer`, `.gc`, `.transition`, …) | Single compact JSON file; two Perl-compatible sidecar files (`.repeats.W1000.data`, `.inserts.W1000.data`) are also written when `--te_annot` is provided |
 | Genome data download | `createModel.pl` can auto-fetch annotation files from UCSC | Not supported — provide files explicitly |
 | Gzip support | Manual decompression required | All input files auto-detected and decompressed transparently |

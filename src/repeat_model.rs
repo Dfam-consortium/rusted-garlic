@@ -10,6 +10,8 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+use crate::io::IntervalMap;
+
 // ---------------------------------------------------------------------------
 // Data types
 // ---------------------------------------------------------------------------
@@ -91,6 +93,35 @@ pub fn get_gc_bin(
 }
 
 // ---------------------------------------------------------------------------
+// Interval filter helpers
+// ---------------------------------------------------------------------------
+
+/// Returns true if [start, end) overlaps any interval in the sorted list.
+/// Requires the list to be sorted and non-overlapping (output of sort_and_merge).
+fn overlaps_any(intervals: &[(u32, u32)], start: u32, end: u32) -> bool {
+    if intervals.is_empty() || end <= start {
+        return false;
+    }
+    // First interval whose end is > start (the first candidate that could overlap).
+    let pos = intervals.partition_point(|&(_, e)| e <= start);
+    pos < intervals.len() && intervals[pos].0 < end
+}
+
+/// Returns true if [start, end) is fully contained within any interval in the sorted list.
+/// Requires the list to be sorted and non-overlapping (output of sort_and_merge).
+fn contained_in_any(intervals: &[(u32, u32)], start: u32, end: u32) -> bool {
+    if intervals.is_empty() || end <= start {
+        return false;
+    }
+    // Last interval whose start is <= start.
+    let pos = intervals.partition_point(|&(s, _)| s <= start);
+    if pos == 0 {
+        return false;
+    }
+    intervals[pos - 1].1 >= end
+}
+
+// ---------------------------------------------------------------------------
 // Repeat TSV profiler
 // ---------------------------------------------------------------------------
 
@@ -102,13 +133,21 @@ pub fn get_gc_bin(
 ///
 /// When `rep_id` is `.` each row is treated as an independent unfragmented
 /// element (no fragment assembly, no nesting detection).
+///
+/// `gene_filter`: when provided, TE instances that overlap any interval in this
+/// map are excluded from the TE profile (intron filter).
+///
+/// Returns an `IntervalMap` of all TE genomic intervals (sorted, merged per
+/// chromosome) for use by `profile_trf` to exclude tandem repeats that fall
+/// entirely within a TE.
 pub fn profile_repeats(
     path: impl AsRef<Path>,
     chrom_gc_bins: &HashMap<String, Vec<u32>>,
     win_size: u32,
     num_bins: usize,
     model: &mut RepeatModel,
-) {
+    gene_filter: Option<&IntervalMap>,
+) -> IntervalMap {
     let reader = crate::io::open_reader(path.as_ref());
 
     // Accumulates per-instance data while streaming.
@@ -121,6 +160,8 @@ pub fn profile_repeats(
         type_fam: String, // "name#family"
     }
     let mut repdata: HashMap<String, RepData> = HashMap::new();
+    // Collect all TE genomic intervals for use by profile_trf.
+    let mut te_intervals: IntervalMap = IntervalMap::new();
 
     // For nested-insert detection: track the type#family at each data-row
     // index, and the last row index where each rep_id appeared.
@@ -170,8 +211,19 @@ pub fn profile_repeats(
 
         row_rep_name[cur_row] = Some(type_fam.clone());
 
+        // Collect TE interval for use by profile_trf regardless of rep_id.
+        te_intervals.entry(seq_id.to_string()).or_default().push((ini, end));
+
         // When rep_id is "." treat as independent — no fragment assembly or nesting.
         if rep_id == "." {
+            // Apply gene filter: skip if this TE overlaps a gene region.
+            if let Some(gf) = gene_filter {
+                if let Some(gene_ivs) = gf.get(seq_id) {
+                    if overlaps_any(gene_ivs, ini, end) {
+                        continue;
+                    }
+                }
+            }
             let pos = ini + (end.saturating_sub(ini)) / 2;
             let gc = match get_gc_bin(chrom_gc_bins, seq_id, pos, win_size) {
                 Some(g) => g as usize,
@@ -228,8 +280,19 @@ pub fn profile_repeats(
             });
     }
 
-    // Assign each accumulated repeat instance to a GC bin.
+    // Sort and merge TE intervals so the returned map is ready for binary-search queries.
+    crate::io::sort_and_merge(&mut te_intervals);
+
+    // Assign each accumulated repeat instance to a GC bin, applying gene filter.
     for rd in repdata.values() {
+        // Apply gene filter: skip if this TE overlaps a gene region.
+        if let Some(gf) = gene_filter {
+            if let Some(gene_ivs) = gf.get(&rd.seq_id) {
+                if overlaps_any(gene_ivs, rd.ini, rd.end) {
+                    continue;
+                }
+            }
+        }
         let pos = rd.ini + (rd.end.saturating_sub(rd.ini)) / 2;
         let gc = match get_gc_bin(chrom_gc_bins, &rd.seq_id, pos, win_size) {
             Some(g) => g as usize,
@@ -254,6 +317,8 @@ pub fn profile_repeats(
             model.insert_table[gc_bin].insert(outer, freq_map);
         }
     }
+
+    te_intervals
 }
 
 /// Parse a semicolon-joined multi-fragment TE label into a `TeRepeat`.
@@ -299,11 +364,18 @@ fn parse_te_label(label: &str) -> Option<TeRepeat> {
 // TRF profiler
 // ---------------------------------------------------------------------------
 
-/// Parse a GARLIC-format TRF BED file and populate `model` with simple repeat records.
+/// Parse a UCSC TRF BED file and populate `model` with simple/tandem repeat records.
 ///
 /// Expected columns (whitespace-delimited):
 ///   chrom(0) start(1) end(2) "trf"(3) period(4) copies(5) ?(6)
 ///   percent_match(7) percent_indel(8) ... consensus(last)
+///
+/// `te_intervals`: when provided, tandem repeats that are *fully contained
+/// within* a TE interval are excluded (they are already accounted for by the
+/// TE profile and would distort the simple repeat model).
+///
+/// `gene_filter`: when provided, tandem repeats that *overlap* any gene interval
+/// are excluded (intron filter — mirrors Perl's `checkGene` logic).
 ///
 /// Mirrors Perl's `profileTRF`.
 pub fn profile_trf(
@@ -311,6 +383,8 @@ pub fn profile_trf(
     chrom_gc_bins: &HashMap<String, Vec<u32>>,
     win_size: u32,
     model: &mut RepeatModel,
+    te_intervals: Option<&IntervalMap>,
+    gene_filter: Option<&IntervalMap>,
 ) {
     let reader = crate::io::open_reader(path.as_ref());
 
@@ -343,6 +417,24 @@ pub fn profile_trf(
         let indel: f64 = match f[8].parse() { Ok(v) => v, Err(_) => continue };
         let div = 100.0 - pct_match;
         let consensus = f[f.len() - 1];
+
+        // Skip tandem repeats that are fully contained within a TE interval.
+        if let Some(te_ivs) = te_intervals {
+            if let Some(te_chrom) = te_ivs.get(seq_id) {
+                if contained_in_any(te_chrom, ini, end) {
+                    continue;
+                }
+            }
+        }
+
+        // Skip tandem repeats that overlap a gene region (intron filter).
+        if let Some(gf) = gene_filter {
+            if let Some(gene_ivs) = gf.get(seq_id) {
+                if overlaps_any(gene_ivs, ini, end) {
+                    continue;
+                }
+            }
+        }
 
         let gc = match get_gc_bin(chrom_gc_bins, seq_id, ini, win_size) {
             Some(g) => g as usize,

@@ -107,10 +107,16 @@ struct BuildArgs {
     #[arg(long = "tandem_annot", value_name = "TSV_FILE")]
     tandem_annot: Option<PathBuf>,
 
-    /// Gene annotation TSV for gene-body masking
-    ///   Format: chrom, start, end  [additional columns ignored]  (0-based half-open)
+    /// Gene annotation TSV for masking and profiling filter
+    ///   Format: chrom, txStart, txEnd [, name, strand, exonStarts, exonEnds]
+    ///   exonStarts/exonEnds are comma-separated 0-based half-open coordinates;
+    ///   use "." when exon coordinates are not available.
     #[arg(long = "gene_annot", value_name = "TSV_FILE")]
     gene_annot: Option<PathBuf>,
+
+    /// Mask only exons instead of whole gene bodies (requires exon columns in --gene_annot)
+    #[arg(long = "mask_exon")]
+    mask_exon: bool,
 
     /// Window size in bp for GC isochore binning
     #[arg(short = 'w', long = "win_size", value_name = "INT", default_value = "1000")]
@@ -316,15 +322,43 @@ fn die(msg: &str) -> ! {
 // ---------------------------------------------------------------------------
 
 fn run_build(args: BuildArgs) {
+    // Load gene annotation separately so we can split masking from profiling filter.
+    let (gene_body_ivs, exon_ivs) = if let Some(path) = &args.gene_annot {
+        info!("Loading gene annotations from {:?}...", path);
+        let (bodies, exons) = io::bed::parse_gene_annot(path);
+        info!("  {} gene body intervals loaded", bodies.values().map(|v| v.len()).sum::<usize>());
+        if args.mask_exon {
+            if exons.is_empty() {
+                warn!("--mask_exon specified but no exon coordinates found in {:?}; \
+                       falling back to gene-body masking", path);
+            } else {
+                info!("  {} exon intervals loaded", exons.values().map(|v| v.len()).sum::<usize>());
+            }
+        }
+        (bodies, exons)
+    } else {
+        (io::IntervalMap::new(), io::IntervalMap::new())
+    };
+
+    // Pick which gene intervals go into the mask and serve as the profiling filter.
+    let gene_mask_ivs = if args.mask_exon && !exon_ivs.is_empty() {
+        exon_ivs
+    } else {
+        gene_body_ivs
+    };
+
     let mask = build_mask(
         args.te_annot.as_deref(),
         args.tandem_annot.as_deref(),
-        args.gene_annot.as_deref(),
+        if gene_mask_ivs.is_empty() { None } else { Some(gene_mask_ivs.clone()) },
     );
+    let gene_filter = if gene_mask_ivs.is_empty() { None } else { Some(&gene_mask_ivs) };
+
     let config = ModelConfig {
         mask: mask.as_ref(),
         te_annot_file: args.te_annot.as_deref(),
         tandem_annot_file: args.tandem_annot.as_deref(),
+        gene_filter,
         win_size: args.win_size,
         kmer_size: args.kmer_size,
         num_gc_bins: args.num_gc_bins,
@@ -569,12 +603,13 @@ fn run_complexity(args: ComplexityArgs) {
 // ---------------------------------------------------------------------------
 
 /// Load annotation files into a MaskSet.  Returns None when no files were provided.
+/// Gene intervals are passed in pre-parsed (already split into body vs exon by the caller).
 fn build_mask(
     te_annot: Option<&Path>,
     tandem_annot: Option<&Path>,
-    gene_annot: Option<&Path>,
+    gene_intervals: Option<io::IntervalMap>,
 ) -> Option<MaskSet> {
-    if te_annot.is_none() && tandem_annot.is_none() && gene_annot.is_none() {
+    if te_annot.is_none() && tandem_annot.is_none() && gene_intervals.is_none() {
         return None;
     }
     let mut mask = MaskSet::new();
@@ -597,11 +632,9 @@ fn build_mask(
         );
         mask.add(intervals);
     }
-    if let Some(path) = gene_annot {
-        info!("Loading gene annotations from {:?}...", path);
-        let intervals = io::bed::parse_annot3(path);
+    if let Some(intervals) = gene_intervals {
         info!(
-            "  {} masked intervals loaded",
+            "  {} gene intervals added to mask",
             intervals.values().map(|v| v.len()).sum::<usize>()
         );
         mask.add(intervals);

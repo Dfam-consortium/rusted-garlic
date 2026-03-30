@@ -39,8 +39,11 @@ pub struct ModelConfig<'a> {
     pub mask: Option<&'a MaskSet>,
     /// 12-column TE annotation TSV for TE repeat profiling.
     pub te_annot_file: Option<&'a std::path::Path>,
-    /// 3-column tandem repeat annotation TSV for simple/tandem repeat profiling.
+    /// UCSC TRF BED file for simple/tandem repeat profiling.
     pub tandem_annot_file: Option<&'a std::path::Path>,
+    /// Gene intervals (body or exon) used as a profiling filter:
+    /// TEs / tandem repeats overlapping these regions are excluded from profiles.
+    pub gene_filter: Option<&'a crate::io::IntervalMap>,
     /// Window size in bp for GC binning (default: 1000).
     pub win_size: usize,
     /// K-mer size for base frequency modelling (default: 4).
@@ -1029,15 +1032,20 @@ impl SeqModel {
         if let Some(cfg) = config {
             if cfg.te_annot_file.is_some() || cfg.tandem_annot_file.is_some() {
                 let mut rm = RepeatModel::new(actual_bins);
-                if let Some(rpath) = cfg.te_annot_file {
+                let te_ivs = if let Some(rpath) = cfg.te_annot_file {
                     log::info!("  Profiling TE repeats from {:?}...", rpath);
-                    profile_repeats(rpath, &chrom_gc_bins, win_size as u32,
-                                     actual_bins, &mut rm);
+                    let te_ivs = profile_repeats(rpath, &chrom_gc_bins, win_size as u32,
+                                                 actual_bins, &mut rm, cfg.gene_filter);
                     log::info!("  {} TE records profiled", rm.te_count());
-                }
+                    te_ivs
+                } else {
+                    crate::io::IntervalMap::new()
+                };
                 if let Some(tpath) = cfg.tandem_annot_file {
+                    let te_opt = if te_ivs.is_empty() { None } else { Some(&te_ivs) };
                     log::info!("  Profiling tandem repeats from {:?}...", tpath);
-                    profile_trf(tpath, &chrom_gc_bins, win_size as u32, &mut rm);
+                    profile_trf(tpath, &chrom_gc_bins, win_size as u32, &mut rm,
+                                te_opt, cfg.gene_filter);
                     log::info!("  {} simple repeat records profiled", rm.simple_count());
                 }
                 seq_model.repeat_model = Some(rm);
@@ -1257,6 +1265,7 @@ mod tests {
             mask: None,
             te_annot_file: None,
             tandem_annot_file: None,
+            gene_filter: None,
             win_size,
             kmer_size: 2,
             num_gc_bins,
