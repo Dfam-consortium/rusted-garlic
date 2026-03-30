@@ -135,21 +135,21 @@ cp hg38.trf.bed genome.tandem_annot.tsv
 chrom  txStart  txEnd  name  strand  exonStarts  exonEnds
 ```
 
-Columns 0–2 are required.  Columns 3–4 (`name`, `strand`) are informational and may be `.`.  Columns 5–6 are comma-separated exon start/end coordinate lists; use `.` when exon coordinates are not available (only gene-body masking will be possible in that case).
+Including exon coordinates (columns 5–6) is recommended — they enable `--mask_exon` and make the profiling filter exon-aware.  Columns 3–4 (`name`, `strand`) are informational only.  Use `.` for any optional column when the data are not available; gene-body masking and the profiling filter still work with only columns 0–2.
 
 The gene annotation serves two purposes:
 1. **Masking** — gene bodies (default) or exon intervals (`--mask_exon`) are excluded from k-mer counting
 2. **Profiling filter** — the same intervals used for masking also act as an exclusion filter during repeat profiling: TEs and tandem repeats that overlap those intervals are excluded from their respective simulation profiles (matching Perl's intron filter behavior)
 
 ```bash
-# From a UCSC refGene table — extract the needed columns:
+# Recommended: include exon coordinates (enables --mask_exon and exon-aware profiling filter)
 awk 'NR>1 {
     name=$2; chrom=$3; strand=$4; txStart=$5; txEnd=$6;
     exStarts=$10; exEnds=$11;
     print chrom"\t"txStart"\t"txEnd"\t"name"\t"strand"\t"exStarts"\t"exEnds
 }' refGene.txt > genome.gene_annot.tsv
 
-# Gene-body only (no exon coordinates needed):
+# Alternative: gene bodies only (exon columns omitted — gene-body masking and profiling filter still work)
 awk 'NR>1 {print $3"\t"$5"\t"$6"\t"$2"\t"$4"\t.\t."}' refGene.txt > genome.gene_annot.tsv
 ```
 
@@ -557,7 +557,7 @@ UCSC TRF track downloads are already in this format and require no conversion.
 
 ### Gene annotation format (`--gene_annot`)
 
-`--gene_annot` accepts a 7-column tab-separated file.  Columns 0–2 are required; columns 3–6 are optional but needed for exon-level masking (`--mask_exon`) and the gene profiling filter:
+`--gene_annot` accepts a 7-column tab-separated file.  The full format is recommended — exon coordinates (columns 5–6) enable `--mask_exon` and exon-aware profiling filters.  Columns 0–2 are the only strictly required fields; use `.` for any optional column you don't have:
 
 | Col | Name | Description |
 |---|---|---|
