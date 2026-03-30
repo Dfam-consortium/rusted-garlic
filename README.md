@@ -31,6 +31,8 @@ All dependencies are declared in `Cargo.toml` and fetched automatically by Cargo
 | `clap 4` | CLI argument parsing |
 | `rand 0.8` | Random number generation |
 | `serde` / `serde_json` | Model serialization |
+| `flate2` | Transparent gzip decompression; in-process compression for `cz` complexity measure |
+| `log` / `env_logger` | Structured logging with `--log-level` and `RUST_LOG` override |
 | `itertools` | Iterator utilities |
 
 ---
@@ -136,8 +138,8 @@ chrom  txStart  txEnd  name  strand  exonStarts  exonEnds
 Columns 0–2 are required.  Columns 3–4 (`name`, `strand`) are informational and may be `.`.  Columns 5–6 are comma-separated exon start/end coordinate lists; use `.` when exon coordinates are not available (only gene-body masking will be possible in that case).
 
 The gene annotation serves two purposes:
-1. **Masking** — gene bodies (or exons with `--mask_exon`) are excluded from k-mer counting
-2. **Profiling filter** — TEs and tandem repeats that overlap the masked regions are excluded from their respective profiles (matching Perl's intron filter behavior)
+1. **Masking** — gene bodies (default) or exon intervals (`--mask_exon`) are excluded from k-mer counting
+2. **Profiling filter** — the same intervals used for masking also act as an exclusion filter during repeat profiling: TEs and tandem repeats that overlap those intervals are excluded from their respective simulation profiles (matching Perl's intron filter behavior)
 
 ```bash
 # From a UCSC refGene table — extract the needed columns:
@@ -202,6 +204,12 @@ If `--te_frac` or `--sim_frac` are omitted the fractions are drawn randomly each
 
 ## All command-line options
 
+### Global options
+
+| Flag | Default | Description |
+|---|---|---|
+| `--log-level <LEVEL>` | `info` | Log verbosity: `error`, `warn`, `info`, `debug`, `trace`, or `off`; overridden by `RUST_LOG` environment variable |
+
 ### `build` subcommand
 
 ```
@@ -262,7 +270,7 @@ rusted-garlic emit --model <MODEL_FILE> --out_seq <FASTA_FILE> [OPTIONS]
 | `--te_frac <PERCENT>` | random 10–60 | Target TE coverage 0–100; also used by `coverage` insertion mode |
 | `--sim_frac <PERCENT>` | random 0–2 | Target simple-repeat fraction 0–100 |
 
-**External feature insertion**
+**External feature insertion** *(flag validation implemented; insertion logic not yet complete)*
 
 | Flag | Default | Description |
 |---|---|---|
@@ -271,14 +279,16 @@ rusted-garlic emit --model <MODEL_FILE> --out_seq <FASTA_FILE> [OPTIONS]
 | `--spacing <BP>` | — | Background bp between features; required for `evenly-spaced`, disallowed otherwise |
 | `--allow_nesting` | off | Allow features to overlap prior insertions; `coverage` and `full` only |
 
+> **Note:** `--insert_features` and its associated flags are parsed and validated but the insertion logic is not yet implemented.  The flags will be accepted without error but the feature sequences will not be inserted into the output.
+
 **Output**
 
 | Flag | Default | Description |
 |---|---|---|
 | `--no_soft_mask` | off | Keep inserted repeats uppercase (default: lower-case) |
-| `--out_bed <BED_FILE>` | — | Write repeat insertion records as a 6-column BED file |
+| `--out_bed <BED_FILE>` | — | Write legacy bombardment repeat insertion records as a 6-column BED file |
 
-#### Insertion modes
+#### Insertion modes *(planned)*
 
 | Mode | Required extras | Disallowed | Behaviour |
 |---|---|---|---|
@@ -408,8 +418,8 @@ python3 utils/rm_align_to_tsv.py chr22.fa.align > chr22.te_annot.tsv
 # Get tandem repeat intervals from UCSC TRF track (already BED-like, 0-based half-open):
 cp hg38_trf.bed chr22.tandem_annot.tsv
 
-# Extract gene body intervals from a UCSC refGene table (columns: chrom, txStart, txEnd):
-awk 'NR>1 {print $3"\t"$5"\t"$6}' refGene.txt > chr22.gene_annot.tsv
+# Extract gene annotation from a UCSC refGene table (7-column format with exon coordinates):
+awk 'NR>1 {print $3"\t"$5"\t"$6"\t"$2"\t"$4"\t"$10"\t"$11}' refGene.txt > chr22.gene_annot.tsv
 
 # Obtain consensus sequences — many labs use the Dfam release FASTA or
 # the RepeatMaskerLib.embl converted to FASTA with a one-liner.
@@ -430,14 +440,19 @@ Typical stderr output:
 
 ```
 Building model from "chr22.fa"...
+Loading gene annotations from "chr22.gene_annot.tsv"...
+  34091 gene body intervals loaded
 Loading TE annotations from "chr22.te_annot.tsv"...
   184302 masked intervals loaded
 Loading tandem repeat annotations from "chr22.tandem_annot.tsv"...
   22187 masked intervals loaded
-Loading gene annotations from "chr22.gene_annot.tsv"...
-  34091 masked intervals loaded
-Total mask: 187044 intervals across all sequences
+  34091 gene intervals added to mask
+Total mask: 240580 intervals across all sequences
 Saving model to "chr22.model"...
+  Profiling TE repeats from "chr22.te_annot.tsv"...
+  184302 TE records profiled
+  Profiling tandem repeats from "chr22.tandem_annot.tsv"...
+  21954 simple repeat records profiled
 Writing repeat profile to "chr22.repeats.W1000.data"...
 Writing insert table to "chr22.inserts.W1000.data"...
 ```
@@ -556,7 +571,7 @@ UCSC TRF track downloads are already in this format and require no conversion.
 
 The gene annotation serves two roles:
 1. **Masking** — gene bodies (default) or exon intervals (`--mask_exon`) are excluded from k-mer counting
-2. **Profiling filter** — TE instances and tandem repeats that overlap the masked gene regions are excluded from their respective simulation profiles
+2. **Profiling filter** — the same intervals used for masking also filter repeat profiling: TE instances and tandem repeats overlapping those regions are excluded from their simulation profiles
 
 ### TE annotation format (`--te_annot`) {#te-annotation-format}
 
@@ -636,7 +651,7 @@ src/
     mod.rs         IntervalMap type, sort_and_merge helper
     fasta.rs       Streaming FASTA iterator (plain + gz)
     repeats.rs     12-column repeat TSV parser
-    bed.rs         TRF BED and UCSC gene-table parsers
+    bed.rs         Tandem repeat (TRF BED) and gene annotation parsers
 ```
 
 The build pipeline is three sequential passes over the input FASTA:
@@ -719,18 +734,18 @@ During repeat profiling (Pass 3), each annotated repeat is assigned to a GC bin 
 | Feature | Description |
 |---|---|
 | `complexity` subcommand | Ports the separate `SeqComplexity.pm` / `gatherStats.pl` workflow into the binary; computes all 12 sequence complexity measures (composition, entropy, k-mer diversity, compression) over sliding windows with a single command |
+| Profiling filter for TEs and tandem repeats | TEs overlapping gene regions and tandem repeats that are either contained within a TE interval or overlap a gene region are excluded from simulation profiles (the Perl code only filtered tandem/TE repeats that overlapped gene-masked sequence) |
+| `--mask_exon` with unified profiling filter | Masking and profiling exclusion use the same interval set (gene bodies or exons); in Perl the exon-masking and gene-body profiling filter were separate code paths |
 | Streaming FASTA reader | Processes arbitrarily large FASTA files without loading them into memory |
 | In-process gzip compression | `cz` measure uses `flate2` in-process rather than shelling out to `gzip` with temp files |
 
-### Features present in Perl GARLIC not yet in `rusted-garlic`
+### Features not yet fully implemented in `rusted-garlic`
 
-The following `createModel.pl` / `createFakeSequence.pl` options have no equivalent in the current Rust version:
-
-| Perl flag | Description |
+| Feature | Status |
 |---|---|
-| `--gc_post_mask` | Recompute GC bins after masking (Pass 1 uses masked sequence) |
-| `--mask_exon` | Mask only exons rather than whole gene bodies |
-| `--revcomp_kmer` | Average k-mer frequencies with their reverse-complement |
-| `--write_mask_seq` | Write masked genome FASTA alongside the model |
-| Exclusion patterns | Skip sequences matching a regex (e.g. `_random`, `chrUn`) |
-| `--binsize` | Override the GC bin step size directly |
+| `--insert_features` (external feature insertion) | CLI flags parsed and validated; insertion logic not yet complete |
+| `--gc_post_mask` | Recompute GC bins after masking (Pass 1 uses masked sequence) — Perl only |
+| `--revcomp_kmer` | Average k-mer frequencies with their reverse-complement — Perl only |
+| `--write_mask_seq` | Write masked genome FASTA alongside the model — Perl only |
+| Exclusion patterns | Skip sequences matching a regex (e.g. `_random`, `chrUn`) — Perl only |
+| `--binsize` | Override the GC bin step size directly — Perl only |
