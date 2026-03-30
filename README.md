@@ -7,8 +7,8 @@ A Rust port of [GARLIC](https://doi.org/10.1093/nar/gku356) — the **G**enome *
 - GC isochore structure (configurable window size, default 1 kb, smoothed over ±5 flanking windows)
 - k-mer Markov base frequencies per GC bin (configurable k, default 4)
 - GC bin transition probabilities between adjacent windows
-- Interspersed repeat (TE) content, evolved from consensus sequences
-- Simple/tandem repeat content
+- Interspersed repeat (TE) content, evolved from consensus sequences [optional]
+- Simple/tandem repeat content [optional]
 
 The model is saved to a compact JSON file so you only need to process the real genome once.
 
@@ -64,6 +64,9 @@ rusted-garlic emit --model genome.model --out_seq artificial.fa --seq_size 10m
 
 `--seq_size` accepts bare integers or the suffixes `k`, `m`, `g` (case-insensitive).  Without `--seq_size` the output is the same length as the input genome.
 
+In this simple case, the sequence model is being trained on the full-genomic sequence including (if present), transposable element sequences, simple/tandem repeats,
+and gene regions.  See the full workflow below to generate true-background sequence models.
+
 ### 2a. Generate multiple sequences in one run
 
 Use `-N` / `--num_seqs` to write several independent sequences into a single FASTA file:
@@ -77,7 +80,7 @@ The sequences are named `artificial_sequence_1`, `artificial_sequence_2`, … `a
 
 ---
 
-## Full workflow with repeat masking and TE bombardment
+## Full workflow with true-background sequence model, and feature simulation
 
 This is the intended high-fidelity workflow for genome benchmark data.
 
@@ -88,39 +91,59 @@ You need:
 | File | Description |
 |---|---|
 | `genome.fa[.gz]` | Reference genome FASTA |
-| `genome.repeats.tsv[.gz]` | Interspersed repeat annotations (see below) |
-| `genome.trf.bed[.gz]` | UCSC TRF BED file (0-based half-open) |
-| `refGene.txt[.gz]` | UCSC refGene/ensGene table |
+| `genome.te_annot.tsv[.gz]` | Interspersed repeat (TE) annotations (see below) |
+| `genome.tandem_annot.tsv[.gz]` | Tandem/simple repeat annotations (0-based half-open BED-like) |
+| `genome.gene_annot.tsv[.gz]` | Gene body annotations (0-based half-open BED-like) |
 | `RepeatMaskerLib.fa[.gz]` | TE consensus FASTA (from RepBase / Dfam) |
 
 All input files are auto-detected as gzip-compressed when their name ends in `.gz` and are decompressed transparently — no manual `gunzip` required.
 
-**Preparing the repeat TSV from RepeatMasker output:**
+**Preparing the TE annotation TSV from RepeatMasker output:**
 
-`--repeats` expects a 12-column tab-separated file (see [Repeat TSV format](#repeat-tsv-format) below).  Use the provided converter to produce it from a RepeatMasker `.align` file:
+`--te_annot` expects a 12-column tab-separated file (see [TE annotation format](#te-annotation-format) below).  Use the provided converter to produce it from a RepeatMasker `.align` file:
 
 ```bash
-python3 utils/rm_align_to_tsv.py genome.fa.align > genome.repeats.tsv
+python3 utils/rm_align_to_tsv.py genome.fa.align > genome.te_annot.tsv
 # or directly from a gzip-compressed file:
-python3 utils/rm_align_to_tsv.py genome.fa.align.gz > genome.repeats.tsv
+python3 utils/rm_align_to_tsv.py genome.fa.align.gz > genome.te_annot.tsv
+```
+
+**Preparing the tandem repeat annotation TSV:**
+
+`--tandem_annot` expects a simple 3-column BED-like file (`chrom`, `start`, `end`, 0-based half-open).  Any source of tandem/simple repeat intervals works — UCSC TRF track, self-generated TRF output, or custom annotations — as long as the first three columns follow the standard coordinate convention:
+
+```bash
+# From a UCSC TRF BED download (already in the right format):
+cp hg38.trf.bed genome.tandem_annot.tsv
+
+# From raw TRF output, a simple awk conversion may be needed to reformat.
+```
+
+**Preparing the gene annotation TSV:**
+
+`--gene_annot` also expects `chrom`, `start`, `end` in the first three columns (0-based half-open).  Any transcript/gene interval source works.  If starting from a UCSC refGene/ensGene table you will need to extract the relevant columns:
+
+```bash
+# Extract chrom, txStart, txEnd from a UCSC gene table (already 0-based half-open):
+awk 'NR>1 {print $3"\t"$5"\t"$6}' refGene.txt > genome.gene_annot.tsv
 ```
 
 ### Step 2 — Build a masked model with repeat profiling
 
 ```bash
 rusted-garlic build \
-  --in_seq    genome.fa \
-  --model     genome.model \
-  --repeats   genome.repeats.tsv \
-  --trf       genome.trf.bed \
-  --genes     refGene.txt
+  --in_seq       genome.fa \
+  --model        genome.model \
+  --te_annot     genome.te_annot.tsv \
+  --tandem_annot genome.tandem_annot.tsv \
+  --gene_annot   genome.gene_annot.tsv
 ```
 
 What each masking flag does:
 
-- `--repeats` — masks interspersed repeats before k-mer counting; also profiles TE divergence/insertion/deletion rates per GC bin
-- `--trf` — masks simple/tandem repeats before k-mer counting; also profiles simple repeat units and rates per GC bin
-- `--genes` — masks gene bodies before k-mer counting (no repeat profiling)
+- `--te_annot` — masks interspersed repeats before k-mer counting; also profiles TE divergence/insertion/deletion rates per GC bin
+- `--tandem_annot` — masks simple/tandem repeats before k-mer counting; also profiles simple repeat units and rates per GC bin
+- `--gene_annot` — masks gene bodies before k-mer counting (no repeat profiling)
 
 Two Perl-compatible sidecar files are written alongside the model:
 
@@ -172,9 +195,11 @@ rusted-garlic build --in_seq <FASTA_FILE> --model <MODEL_FILE> [OPTIONS]
 
 | Flag | Description |
 |---|---|
-| `-r, --repeats <TSV_FILE>` | Repeat annotation TSV for masking + TE profiling (see [Repeat TSV format](#repeat-tsv-format)) |
-| `-t, --trf <BED_FILE>` | UCSC TRF BED for masking + simple repeat profiling |
-| `-g, --genes <GENE_FILE>` | UCSC refGene/ensGene table for gene-body masking |
+| `--te_annot <TSV_FILE>` | 12-column TE annotation TSV for masking + TE profiling (see [TE annotation format](#te-annotation-format)) |
+| `--tandem_annot <TSV_FILE>` | 3-column tandem/simple repeat annotation TSV for masking + tandem repeat profiling |
+| `--gene_annot <TSV_FILE>` | 3-column gene body annotation TSV for masking |
+
+All three annotation files use 0-based half-open coordinates.  `--tandem_annot` and `--gene_annot` need only `chrom`, `start`, `end` in the first three columns; any additional columns are ignored.
 
 **Model parameters (stored in the model file)**
 
@@ -352,11 +377,14 @@ This walks through a realistic small example using chr22.
 # Run RepeatMasker:
 RepeatMasker -pa 16 -species human -align chr22.fa
 
-# Convert .align output to the repeat TSV format:
-python3 utils/rm_align_to_tsv.py chr22.fa.align > chr22.repeats.tsv
+# Convert .align output to the TE annotation TSV:
+python3 utils/rm_align_to_tsv.py chr22.fa.align > chr22.te_annot.tsv
 
-# Get TRF BED from UCSC (or run TRF yourself and convert to BED)
-# Get refGene from UCSC Table Browser
+# Get tandem repeat intervals from UCSC TRF track (already BED-like, 0-based half-open):
+cp hg38_trf.bed chr22.tandem_annot.tsv
+
+# Extract gene body intervals from a UCSC refGene table (columns: chrom, txStart, txEnd):
+awk 'NR>1 {print $3"\t"$5"\t"$6}' refGene.txt > chr22.gene_annot.tsv
 
 # Obtain consensus sequences — many labs use the Dfam release FASTA or
 # the RepeatMaskerLib.embl converted to FASTA with a one-liner.
@@ -366,22 +394,22 @@ python3 utils/rm_align_to_tsv.py chr22.fa.align > chr22.repeats.tsv
 
 ```bash
 rusted-garlic build \
-  --in_seq  chr22.fa \
-  --model   chr22.model \
-  --repeats chr22.repeats.tsv \
-  --trf     chr22.trf.bed \
-  --genes   refGene.txt
+  --in_seq       chr22.fa \
+  --model        chr22.model \
+  --te_annot     chr22.te_annot.tsv \
+  --tandem_annot chr22.tandem_annot.tsv \
+  --gene_annot   chr22.gene_annot.tsv
 ```
 
 Typical stderr output:
 
 ```
 Building model from "chr22.fa"...
-Loading repeat annotations from "chr22.fa.align"...
+Loading TE annotations from "chr22.te_annot.tsv"...
   184302 masked intervals loaded
-Loading TRF annotations from "chr22.trf.bed"...
+Loading tandem repeat annotations from "chr22.tandem_annot.tsv"...
   22187 masked intervals loaded
-Loading gene annotations from "refGene.txt"...
+Loading gene annotations from "chr22.gene_annot.tsv"...
   34091 masked intervals loaded
 Total mask: 187044 intervals across all sequences
 Saving model to "chr22.model"...
@@ -424,14 +452,14 @@ To use 5-mers and 500 bp windows (e.g. for a GC-rich or compact genome):
 
 ```bash
 rusted-garlic build \
-  --in_seq      chr22.fa \
-  --model       chr22_k5w500.model \
-  --repeats     chr22.repeats.tsv \
-  --trf         chr22.trf.bed \
-  --genes       refGene.txt \
-  --kmer_size   5 \
-  --win_size    500 \
-  --num_gc_bins 20
+  --in_seq       chr22.fa \
+  --model        chr22_k5w500.model \
+  --te_annot     chr22.te_annot.tsv \
+  --tandem_annot chr22.tandem_annot.tsv \
+  --gene_annot   chr22.gene_annot.tsv \
+  --kmer_size    5 \
+  --win_size     500 \
+  --num_gc_bins  20
 ```
 
 Then generate sequences as usual — the stored parameters are applied automatically:
@@ -461,9 +489,25 @@ print(f'Repeat: {lc} bp  ({100*lc/total:.1f}%)')
 
 ---
 
-## Repeat TSV format
+## Annotation file formats
 
-The `--repeats` flag accepts a 12-column tab-separated file with 0-based half-open coordinates (BED convention).  Lines beginning with `#` are treated as comments.
+All three annotation flags (`--te_annot`, `--tandem_annot`, `--gene_annot`) accept tab- or whitespace-delimited files with 0-based half-open coordinates.  Lines beginning with `#` are treated as comments and skipped.
+
+### `--tandem_annot` and `--gene_annot` format
+
+Both flags expect a simple 3-column BED-like file.  Any additional columns are ignored:
+
+| Col | Name | Description |
+|---|---|---|
+| 0 | `chrom` | Sequence / chromosome name |
+| 1 | `start` | 0-based half-open start |
+| 2 | `end` | 0-based half-open end |
+
+These are the same first three columns used by standard BED files and UCSC TRF track downloads.
+
+### TE annotation format (`--te_annot`) {#te-annotation-format}
+
+The `--te_annot` flag accepts a 12-column tab-separated file with 0-based half-open coordinates (BED convention).  Lines beginning with `#` are treated as comments.
 
 | Col | Name | Description |
 |---|---|---|
@@ -482,7 +526,7 @@ The `--repeats` flag accepts a 12-column tab-separated file with 0-based half-op
 
 `rep_id` serves two purposes: it ties multiple fragments of the same repeat instance together (so divergence stats are taken as the max across all fragments), and it enables nested-insertion detection (elements appearing between two occurrences of the same `rep_id` in the file are recorded as nested inside that repeat).  Use `.` when the source data does not track instance identity; each row is then treated as an independent unfragmented element and nesting is not recorded.
 
-Simple/tandem repeats must be excluded from this file — they are handled separately by `--trf`.
+Simple/tandem repeats must be excluded from this file — they are handled separately by `--tandem_annot`.
 
 **Example rows:**
 ```
@@ -496,8 +540,8 @@ chr22	5000	5312	L1HS	LINE/L1	-	18.20	1.10	0.80	1	312	m_b2s001i3
 `utils/rm_align_to_tsv.py` converts a RepeatMasker `.align` file to this format:
 
 ```bash
-python3 utils/rm_align_to_tsv.py genome.fa.align    > genome.repeats.tsv
-python3 utils/rm_align_to_tsv.py genome.fa.align.gz > genome.repeats.tsv
+python3 utils/rm_align_to_tsv.py genome.fa.align    > genome.te_annot.tsv
+python3 utils/rm_align_to_tsv.py genome.fa.align.gz > genome.te_annot.tsv
 ```
 
 The script filters out Simple_repeat, Low_complexity, Unknown, and Satellite entries and handles both positive- and negative-strand `.align` header layouts.
@@ -506,7 +550,7 @@ The script filters out Simple_repeat, Low_complexity, Unknown, and Satellite ent
 
 ## Sidecar files
 
-When `build` is run with `--repeats`, two text files are written alongside the model that are compatible with the original Perl `createFakeSequence.pl`.  The filenames always use the `W1000` suffix for Perl compatibility regardless of `--win_size`:
+When `build` is run with `--te_annot` (and/or `--tandem_annot`), two text files are written alongside the model that are compatible with the original Perl `createFakeSequence.pl`.  The filenames always use the `W1000` suffix for Perl compatibility regardless of `--win_size`:
 
 **`<stem>.repeats.W1000.data`** — one record per TE / simple repeat per GC bin:
 ```
@@ -569,8 +613,8 @@ All sequences are written to a single FASTA file.  When `num_seqs > 1` each reco
 | Aspect | Perl GARLIC | `rusted-garlic` |
 |---|---|---|
 | Entry points | Two scripts: `createModel.pl` (build) and `createFakeSequence.pl` (emit) | Single binary with `build` and `emit` subcommands |
-| Repeat input format | RepeatMasker `.align` / `.out` parsed directly | Generic 12-column TSV (convert with `utils/rm_align_to_tsv.py`) |
-| Model format | Multiple text sidecar files (`.kmer`, `.gc`, `.transition`, …) | Single compact JSON file; two Perl-compatible sidecar files (`.repeats.W1000.data`, `.inserts.W1000.data`) are also written when `--repeats` is provided |
+| Repeat input format | RepeatMasker `.align` / `.out` parsed directly | Generic 12-column TSV via `--te_annot` (convert with `utils/rm_align_to_tsv.py`); tandem and gene intervals via `--tandem_annot` / `--gene_annot` as simple 3-column BED-like files |
+| Model format | Multiple text sidecar files (`.kmer`, `.gc`, `.transition`, …) | Single compact JSON file; two Perl-compatible sidecar files (`.repeats.W1000.data`, `.inserts.W1000.data`) are also written when `--te_annot` is provided |
 | Genome data download | `createModel.pl` can auto-fetch annotation files from UCSC | Not supported — provide files explicitly |
 | Gzip support | Manual decompression required | All input files auto-detected and decompressed transparently |
 

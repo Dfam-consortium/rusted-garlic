@@ -37,10 +37,10 @@ pub struct EmitConfig<'a> {
 pub struct ModelConfig<'a> {
     /// Annotation-based mask applied during k-mer counting (Pass 2).
     pub mask: Option<&'a MaskSet>,
-    /// RepeatMasker `.align` / `.out` file for TE repeat profiling.
-    pub repeat_file: Option<&'a std::path::Path>,
-    /// UCSC TRF BED file for simple/tandem repeat profiling.
-    pub trf_file: Option<&'a std::path::Path>,
+    /// 12-column TE annotation TSV for TE repeat profiling.
+    pub te_annot_file: Option<&'a std::path::Path>,
+    /// 3-column tandem repeat annotation TSV for simple/tandem repeat profiling.
+    pub tandem_annot_file: Option<&'a std::path::Path>,
     /// Window size in bp for GC binning (default: 1000).
     pub win_size: usize,
     /// K-mer size for base frequency modelling (default: 4).
@@ -252,7 +252,7 @@ impl SeqModel {
                     all_records.extend(recs);
                 } else {
                     log::warn!("--te_cons provided but the model has no TE repeat records; \
-                                rebuild with --repeats <align_file> to enable TE insertion");
+                                rebuild with --te_annot <tsv_file> to enable TE insertion");
                 }
             }
             if sim_total > 0 {
@@ -268,7 +268,7 @@ impl SeqModel {
                 all_records.extend(recs);
             } else if cfg.sim_frac.is_some() {
                 log::warn!("--sim_frac provided but the model has no simple repeat records; \
-                            rebuild with --trf <bed_file> to enable simple repeat insertion");
+                            rebuild with --tandem_annot <tsv_file> to enable simple repeat insertion");
             }
         }
 
@@ -1027,16 +1027,16 @@ impl SeqModel {
         // Profile TE and simple repeats from annotation files (if provided).
         // Uses chrom_gc_bins built during Pass 1 smoothing.
         if let Some(cfg) = config {
-            if cfg.repeat_file.is_some() || cfg.trf_file.is_some() {
+            if cfg.te_annot_file.is_some() || cfg.tandem_annot_file.is_some() {
                 let mut rm = RepeatModel::new(actual_bins);
-                if let Some(rpath) = cfg.repeat_file {
-                    log::info!("  Profiling repeats from {:?}...", rpath);
+                if let Some(rpath) = cfg.te_annot_file {
+                    log::info!("  Profiling TE repeats from {:?}...", rpath);
                     profile_repeats(rpath, &chrom_gc_bins, win_size as u32,
                                      actual_bins, &mut rm);
                     log::info!("  {} TE records profiled", rm.te_count());
                 }
-                if let Some(tpath) = cfg.trf_file {
-                    log::info!("  Profiling simple repeats from {:?}...", tpath);
+                if let Some(tpath) = cfg.tandem_annot_file {
+                    log::info!("  Profiling tandem repeats from {:?}...", tpath);
                     profile_trf(tpath, &chrom_gc_bins, win_size as u32, &mut rm);
                     log::info!("  {} simple repeat records profiled", rm.simple_count());
                 }
@@ -1255,8 +1255,8 @@ mod tests {
     fn basic_config(win_size: usize, num_gc_bins: usize) -> ModelConfig<'static> {
         ModelConfig {
             mask: None,
-            repeat_file: None,
-            trf_file: None,
+            te_annot_file: None,
+            tandem_annot_file: None,
             win_size,
             kmer_size: 2,
             num_gc_bins,

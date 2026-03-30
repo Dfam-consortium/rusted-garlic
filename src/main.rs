@@ -79,9 +79,9 @@ Examples:
   # Build a basic model:
   rusted_garlic build --in_seq hg38.fa --model hg38.model
 
-  # Build a masked model (repeats + simple repeats + genes):
+  # Build a masked model (TE + tandem repeats + genes):
   rusted_garlic build --in_seq hg38.fa --model hg38.model \\
-      --repeats hg38.fa.align --trf hg38.trf.bed --genes refGene.txt
+      --te_annot hg38.te_annot.tsv --tandem_annot hg38.tandem_annot.tsv --gene_annot hg38.gene_annot.tsv
 
   # Build with non-default parameters:
   rusted_garlic build --in_seq hg38.fa --model hg38.model \\
@@ -96,17 +96,21 @@ struct BuildArgs {
     #[arg(short, long, value_name = "MODEL_FILE")]
     model: PathBuf,
 
-    /// RepeatMasker .align or .out file for masking interspersed repeats
-    #[arg(short, long, value_name = "ALIGN_FILE")]
-    repeats: Option<PathBuf>,
+    /// Interspersed repeat (TE) annotation TSV for masking + TE profiling
+    ///   Format: chrom, start, end, name, family, strand, div, ins, del, cons_start, cons_end, rep_id
+    ///   (0-based half-open; convert from RepeatMasker .align with utils/rm_align_to_tsv.py)
+    #[arg(long = "te_annot", value_name = "TSV_FILE")]
+    te_annot: Option<PathBuf>,
 
-    /// TRF BED file (UCSC format) for masking simple/tandem repeats
-    #[arg(short, long, value_name = "BED_FILE")]
-    trf: Option<PathBuf>,
+    /// Tandem/simple repeat annotation TSV for masking
+    ///   Format: chrom, start, end  [additional columns ignored]  (0-based half-open)
+    #[arg(long = "tandem_annot", value_name = "TSV_FILE")]
+    tandem_annot: Option<PathBuf>,
 
-    /// UCSC gene table (ensGene/refGene format) for masking gene bodies
-    #[arg(short, long, value_name = "GENE_FILE")]
-    genes: Option<PathBuf>,
+    /// Gene annotation TSV for gene-body masking
+    ///   Format: chrom, start, end  [additional columns ignored]  (0-based half-open)
+    #[arg(long = "gene_annot", value_name = "TSV_FILE")]
+    gene_annot: Option<PathBuf>,
 
     /// Window size in bp for GC isochore binning
     #[arg(short = 'w', long = "win_size", value_name = "INT", default_value = "1000")]
@@ -313,14 +317,14 @@ fn die(msg: &str) -> ! {
 
 fn run_build(args: BuildArgs) {
     let mask = build_mask(
-        args.repeats.as_deref(),
-        args.trf.as_deref(),
-        args.genes.as_deref(),
+        args.te_annot.as_deref(),
+        args.tandem_annot.as_deref(),
+        args.gene_annot.as_deref(),
     );
     let config = ModelConfig {
         mask: mask.as_ref(),
-        repeat_file: args.repeats.as_deref(),
-        trf_file: args.trf.as_deref(),
+        te_annot_file: args.te_annot.as_deref(),
+        tandem_annot_file: args.tandem_annot.as_deref(),
         win_size: args.win_size,
         kmer_size: args.kmer_size,
         num_gc_bins: args.num_gc_bins,
@@ -566,17 +570,17 @@ fn run_complexity(args: ComplexityArgs) {
 
 /// Load annotation files into a MaskSet.  Returns None when no files were provided.
 fn build_mask(
-    repeats: Option<&Path>,
-    trf: Option<&Path>,
-    genes: Option<&Path>,
+    te_annot: Option<&Path>,
+    tandem_annot: Option<&Path>,
+    gene_annot: Option<&Path>,
 ) -> Option<MaskSet> {
-    if repeats.is_none() && trf.is_none() && genes.is_none() {
+    if te_annot.is_none() && tandem_annot.is_none() && gene_annot.is_none() {
         return None;
     }
     let mut mask = MaskSet::new();
 
-    if let Some(path) = repeats {
-        info!("Loading repeat annotations from {:?}...", path);
+    if let Some(path) = te_annot {
+        info!("Loading TE annotations from {:?}...", path);
         let intervals = io::repeats::parse(path);
         info!(
             "  {} masked intervals loaded",
@@ -584,18 +588,18 @@ fn build_mask(
         );
         mask.add(intervals);
     }
-    if let Some(path) = trf {
-        info!("Loading TRF annotations from {:?}...", path);
-        let intervals = io::bed::parse_trf(path);
+    if let Some(path) = tandem_annot {
+        info!("Loading tandem repeat annotations from {:?}...", path);
+        let intervals = io::bed::parse_annot3(path);
         info!(
             "  {} masked intervals loaded",
             intervals.values().map(|v| v.len()).sum::<usize>()
         );
         mask.add(intervals);
     }
-    if let Some(path) = genes {
+    if let Some(path) = gene_annot {
         info!("Loading gene annotations from {:?}...", path);
-        let intervals = io::bed::parse_gene_table(path);
+        let intervals = io::bed::parse_annot3(path);
         info!(
             "  {} masked intervals loaded",
             intervals.values().map(|v| v.len()).sum::<usize>()

@@ -1,32 +1,22 @@
-/// Parsers for BED-format annotation files used in masking.
+/// Parsers for BED-like annotation files used in masking.
 ///
-/// Two formats are supported:
+/// All three annotation types (TE, tandem repeat, gene) share the same
+/// 3-column BED-like format (0-based half-open coordinates):
 ///
-/// 1. TRF BED (UCSC format, 0-based half-open):
-///       chrom  start  end  ...
-///    Columns 0, 1, 2.  All remaining columns are ignored.
+///   chrom  start  end  [additional columns ignored]
 ///
-/// 2. UCSC gene table (ensGene / refGene, 0-based half-open):
-///       bin  name  chrom  strand  txStart  txEnd  ...
-///    Columns 2, 4, 5 give chrom, txStart, txEnd.
-///
-/// Both return intervals as 0-based half-open [start, end) ready for the
-/// MaskSet, so no coordinate conversion is needed.
+/// Files may be tab- or whitespace-delimited.  Comment lines (`#`) and
+/// lines with fewer than 3 fields are skipped.  No coordinate conversion
+/// is performed — coordinates are expected to already be 0-based half-open.
 use std::io::BufRead;
 use std::path::Path;
 
 use super::IntervalMap;
 
-/// Parse a TRF BED file (UCSC format, 0-based half-open).
-/// Fields: chrom(0)  start(1)  end(2)  [...]
-pub fn parse_trf(path: impl AsRef<Path>) -> IntervalMap {
+/// Parse a BED-like annotation file with chrom/start/end in the first three columns.
+/// Used for tandem repeat annotations, gene annotations, or any other interval source.
+pub fn parse_annot3(path: impl AsRef<Path>) -> IntervalMap {
     parse_bed_columns(path, 0, 1, 2)
-}
-
-/// Parse a UCSC gene/transcript table (ensGene / refGene format).
-/// Fields: bin(0)  name(1)  chrom(2)  strand(3)  txStart(4)  txEnd(5)  [...]
-pub fn parse_gene_table(path: impl AsRef<Path>) -> IntervalMap {
-    parse_bed_columns(path, 2, 4, 5)
 }
 
 /// General BED-column reader.  `id_col`, `start_col`, `end_col` specify which
