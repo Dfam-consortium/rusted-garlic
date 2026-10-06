@@ -749,3 +749,15 @@ During repeat profiling (Pass 3), each annotated repeat is assigned to a GC bin 
 | `--write_mask_seq` | Write masked genome FASTA alongside the model — Perl only |
 | Exclusion patterns | Skip sequences matching a regex (e.g. `_random`, `chrUn`) — Perl only |
 | `--binsize` | Override the GC bin step size directly — Perl only |
+
+
+
+
+## AI Assistance Disclosure
+This tool was written with the assistance of AI coding agents (Claude, GitHub Copilot).
+
+Correctness is validated by comparing output against Garlic v1.5 on a suite of real assembly datasets - not by manual code review alone. The background sequence modeling/simulation algorithm was hand-coded, however AI generated the full Garlic interface implementation; humans defined the validation criteria and verified the results.
+
+See VALIDATION.md for full validation methodology.
+
+AI rewrite stewardship based on https://rewrites.bio/ standard.

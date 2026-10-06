@@ -370,17 +370,6 @@ fn run_build(args: BuildArgs) {
     info!("Saving model to {:?}...", args.model);
     m.to_file(&args.model);
 
-    if m.repeat_model.is_some() {
-        let gc_strs = m.gc_range_strings();
-        let rm = m.repeat_model.as_ref().unwrap();
-        let stem = args.model.with_extension("");
-        let rep_path = stem.with_extension("repeats.W1000.data");
-        let ins_path = stem.with_extension("inserts.W1000.data");
-        info!("Writing repeat profile to {:?}...", rep_path);
-        repeat_model::write_repeats_file(&rep_path, rm, &gc_strs);
-        info!("Writing insert table to {:?}...", ins_path);
-        repeat_model::write_inserts_file(&ins_path, rm, &gc_strs);
-    }
 }
 
 fn run_emit(args: EmitArgs) {

@@ -364,7 +364,7 @@ impl SeqModel {
                         // Perhaps only calculate GC iff there is enough data and use previous
                         // GC otherwise
                         if acgt_count > 0 {
-                            gc = ((win_cg_count as f64 / acgt_count as f64) * 1000.0) as u32;
+                            gc = ((win_cg_count as f64 / acgt_count as f64) * 1000.0).round() as u32;
                         }
 
                         // To simulate GARLIC approach
@@ -389,7 +389,7 @@ impl SeqModel {
                             let mut gc = NA_SENTINEL;
                             let acgt_count = win_cg_count + win_at_count;
                             if acgt_count > 0 {
-                                gc = ((win_cg_count as f64 / acgt_count as f64) * 1000.0) as u32;
+                                gc = ((win_cg_count as f64 / acgt_count as f64) * 1000.0).round() as u32;
                             }
                             // Emit a window
                             bingc.push(gc);
@@ -407,7 +407,7 @@ impl SeqModel {
                                 let acgt_count = win_cg_count + win_at_count;
                                 if acgt_count > 0 {
                                     gc =
-                                        ((win_cg_count as f64 / acgt_count as f64) * 1000.0) as u32;
+                                        ((win_cg_count as f64 / acgt_count as f64) * 1000.0).round() as u32;
                                 }
                                 bingc.push(gc);
                                 cumul_gc_win_counts[gc as usize] += 1;
@@ -791,7 +791,10 @@ impl SeqModel {
                 for _n in 0..cmp::min(gc_queue.len(), 6) {
                     let mut gc_avg = NA_SENTINEL;
                     if gc_cnt > 0 {
-                        gc_avg = (gc_sum as f64 / gc_cnt as f64) as u32;
+                        // Round (not truncate) the smoothed GC mean: truncation biases
+                        // every fractional value downward (~0.045% GC genome-wide). See
+                        // PERL_VS_RUST_DIFFS.md (floor→round change) — matches Perl classGC.
+                        gc_avg = (gc_sum as f64 / gc_cnt as f64).round() as u32;
                     }
                     let gc_bin = gc_lookup[gc_avg as usize];
                     if prev_gc_bin != sentinel_bin && gc_bin != sentinel_bin {
@@ -844,7 +847,8 @@ impl SeqModel {
             if gc_queue.len() > FLANK_WINDOWS {
                 let mut gc_avg = NA_SENTINEL;
                 if gc_cnt > 0 {
-                    gc_avg = (gc_sum as f64 / gc_cnt as f64) as u32;
+                    // Round (not truncate) the smoothed GC mean — see note above.
+                    gc_avg = (gc_sum as f64 / gc_cnt as f64).round() as u32;
                 }
                 let gc_bin = gc_lookup[gc_avg as usize];
                 if prev_gc_bin != sentinel_bin && gc_bin != sentinel_bin {

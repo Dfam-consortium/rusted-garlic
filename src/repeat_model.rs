@@ -4,7 +4,6 @@
 /// `createModel.pl`.  The profile is stored per GC bin (indexed 0..num_bins-1)
 /// and serialised alongside the sequence model in the JSON model file.
 use std::collections::HashMap;
-use std::fs::File;
 use std::io::BufRead;
 use std::path::Path;
 
@@ -16,12 +15,13 @@ use crate::io::IntervalMap;
 // Data types
 // ---------------------------------------------------------------------------
 
-/// One interspersed (TE) repeat record — the fields that `createFakeSequence`
-/// needs to simulate an evolved copy.
+/// One interspersed (TE) repeat record — the fields needed to simulate an
+/// evolved copy.
 ///
-/// Corresponds to a line in the `.repeats.W1000.data` file:
-///   `name:family:dir:div:ins:del:length:nfrg`
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Serialized as a compact JSON array `[name, family, dir, div, ins, del, length, nfrg]`
+/// rather than a named-field object, to avoid repeating field names across the
+/// ~2 M records typically present in a genome model.
+#[derive(Debug, Clone)]
 pub struct TeRepeat {
     pub name: String,   // repeat name   e.g. "AluYa5"
     pub family: String, // class/family  e.g. "SINE/Alu"
@@ -33,17 +33,94 @@ pub struct TeRepeat {
     pub nfrg: u32,      // number of fragments (1 = unfragmented)
 }
 
+impl Serialize for TeRepeat {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        let mut seq = s.serialize_seq(Some(8))?;
+        seq.serialize_element(&self.name)?;
+        seq.serialize_element(&self.family)?;
+        seq.serialize_element(&self.dir.to_string())?;
+        seq.serialize_element(&self.div)?;
+        seq.serialize_element(&self.ins)?;
+        seq.serialize_element(&self.del)?;
+        seq.serialize_element(&self.length)?;
+        seq.serialize_element(&self.nfrg)?;
+        seq.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for TeRepeat {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = TeRepeat;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("[name, family, dir, div, ins, del, length, nfrg]")
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut s: A) -> Result<TeRepeat, A::Error> {
+                use serde::de::Error;
+                let name:   String = s.next_element()?.ok_or_else(|| A::Error::invalid_length(0, &self))?;
+                let family: String = s.next_element()?.ok_or_else(|| A::Error::invalid_length(1, &self))?;
+                let dirs:   String = s.next_element()?.ok_or_else(|| A::Error::invalid_length(2, &self))?;
+                let dir = dirs.chars().next().ok_or_else(|| A::Error::custom("empty dir"))?;
+                let div:    f64    = s.next_element()?.ok_or_else(|| A::Error::invalid_length(3, &self))?;
+                let ins:    f64    = s.next_element()?.ok_or_else(|| A::Error::invalid_length(4, &self))?;
+                let del:    f64    = s.next_element()?.ok_or_else(|| A::Error::invalid_length(5, &self))?;
+                let length: u32    = s.next_element()?.ok_or_else(|| A::Error::invalid_length(6, &self))?;
+                let nfrg:   u32    = s.next_element()?.ok_or_else(|| A::Error::invalid_length(7, &self))?;
+                Ok(TeRepeat { name, family, dir, div, ins, del, length, nfrg })
+            }
+        }
+        d.deserialize_seq(V)
+    }
+}
+
 /// One simple/tandem repeat record.
 ///
-/// Corresponds to a `SIMPLE:...` line in the `.repeats.W1000.data` file:
-///   `SIMPLE:consensus:dir:period:div:indel`
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Serialized as a compact JSON array `[consensus, dir, period, div, indel]`.
+#[derive(Debug, Clone)]
 pub struct SimpleRepeat {
     pub consensus: String, // repeat unit e.g. "AGAT"
     pub dir: char,         // canonical strand after revcomp check
     pub period: u32,       // repeat unit length
     pub div: f64,          // divergence (100 - percent_match from TRF)
     pub indel: f64,        // indel rate from TRF
+}
+
+impl Serialize for SimpleRepeat {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        let mut seq = s.serialize_seq(Some(5))?;
+        seq.serialize_element(&self.consensus)?;
+        seq.serialize_element(&self.dir.to_string())?;
+        seq.serialize_element(&self.period)?;
+        seq.serialize_element(&self.div)?;
+        seq.serialize_element(&self.indel)?;
+        seq.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for SimpleRepeat {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = SimpleRepeat;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("[consensus, dir, period, div, indel]")
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut s: A) -> Result<SimpleRepeat, A::Error> {
+                use serde::de::Error;
+                let consensus: String = s.next_element()?.ok_or_else(|| A::Error::invalid_length(0, &self))?;
+                let dirs:      String = s.next_element()?.ok_or_else(|| A::Error::invalid_length(1, &self))?;
+                let dir = dirs.chars().next().ok_or_else(|| A::Error::custom("empty dir"))?;
+                let period:    u32    = s.next_element()?.ok_or_else(|| A::Error::invalid_length(2, &self))?;
+                let div:       f64    = s.next_element()?.ok_or_else(|| A::Error::invalid_length(3, &self))?;
+                let indel:     f64    = s.next_element()?.ok_or_else(|| A::Error::invalid_length(4, &self))?;
+                Ok(SimpleRepeat { consensus, dir, period, div, indel })
+            }
+        }
+        d.deserialize_seq(V)
+    }
 }
 
 /// The full repeat profile for one genome, indexed by GC bin.
@@ -173,6 +250,7 @@ pub fn profile_repeats(
         vec![HashMap::new(); num_bins];
 
     let mut row_idx: usize = 0;
+    let mut skipped_lines: usize = 0;
 
     for raw in reader.lines() {
         let line = raw.expect("Read error in repeat TSV");
@@ -187,6 +265,7 @@ pub fn profile_repeats(
 
         let f: Vec<&str> = trimmed.split('\t').collect();
         if f.len() < 12 {
+            skipped_lines += 1;
             continue;
         }
 
@@ -316,6 +395,18 @@ pub fn profile_repeats(
                 .collect();
             model.insert_table[gc_bin].insert(outer, freq_map);
         }
+    }
+
+    if skipped_lines > 0 && model.te_count() == 0 {
+        log::error!(
+            "0 TE records loaded from {:?} — all {} non-comment lines were skipped \
+             (fewer than 12 tab-separated fields). \
+             Did you pass a raw RepeatMasker .align file? \
+             Convert it first with: python3 utils/rm_align_to_tsv.py <file> > <file>.tsv",
+            path.as_ref(),
+            skipped_lines
+        );
+        std::process::exit(1);
     }
 
     te_intervals
@@ -496,67 +587,4 @@ fn reverse_complement(seq: &str) -> String {
             other => other,
         })
         .collect()
-}
-
-// ---------------------------------------------------------------------------
-// Text file output (Perl-compatible)
-// ---------------------------------------------------------------------------
-
-/// Write a `.repeats.W1000.data` compatible text file for interoperability
-/// with the Perl `createFakeSequence.pl`.
-pub fn write_repeats_file(
-    path: impl AsRef<Path>,
-    model: &RepeatModel,
-    gc_range_strings: &[String],
-) {
-    use std::io::Write;
-    let mut f = File::create(path.as_ref())
-        .unwrap_or_else(|e| panic!("Cannot create repeats file {:?}: {}", path.as_ref(), e));
-
-    for (gc_bin, gc_str) in gc_range_strings.iter().enumerate() {
-        writeln!(f, "#GC={}", gc_str).expect("Write error");
-        for te in &model.te_profile[gc_bin] {
-            writeln!(
-                f,
-                "{}:{}:{}:{:.2}:{:.2}:{:.2}:{}:{}",
-                te.name, te.family, te.dir, te.div, te.ins, te.del, te.length, te.nfrg
-            )
-            .expect("Write error");
-        }
-        for sr in &model.simple_profile[gc_bin] {
-            writeln!(
-                f,
-                "SIMPLE:{}:{}:{}:{:.2}:{:.2}",
-                sr.consensus, sr.dir, sr.period, sr.div, sr.indel
-            )
-            .expect("Write error");
-        }
-        writeln!(f).expect("Write error");
-    }
-}
-
-/// Write a `.inserts.W1000.data` compatible text file.
-pub fn write_inserts_file(
-    path: impl AsRef<Path>,
-    model: &RepeatModel,
-    gc_range_strings: &[String],
-) {
-    use std::io::Write;
-    let mut f = File::create(path.as_ref())
-        .unwrap_or_else(|e| panic!("Cannot create inserts file {:?}: {}", path.as_ref(), e));
-
-    for (gc_bin, gc_str) in gc_range_strings.iter().enumerate() {
-        writeln!(f, "#GC={}", gc_str).expect("Write error");
-        let mut outer_keys: Vec<&String> = model.insert_table[gc_bin].keys().collect();
-        outer_keys.sort();
-        for outer in outer_keys {
-            let inner_map = &model.insert_table[gc_bin][outer];
-            let mut inner_keys: Vec<&String> = inner_map.keys().collect();
-            inner_keys.sort();
-            for inner in inner_keys {
-                let frq = inner_map[inner];
-                writeln!(f, "{}\t{}\t{:.8}", outer, inner, frq).expect("Write error");
-            }
-        }
-    }
 }
