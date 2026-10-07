@@ -3,6 +3,21 @@
 All notable changes to rusted-garlic. Validation details: `../tier2/README.md` and
 `../PERL_VS_RUST_DIFFS.md`.
 
+## [Unreleased]
+
+### Added
+
+- `emit --seed <INT>`: all randomness comes from one seeded RNG, so a run can be
+  reproduced exactly. Without `--seed` a random seed is drawn and logged.
+- Regression tests (`tests/determinism.rs`, `cargo test --release`): build and seeded
+  emit must be byte-identical across runs and match golden files in `tests/data/golden/`.
+
+### Changed
+
+- `build` output is now byte-identical across runs. Model maps are written in sorted
+  key order and TE records in genomic order instead of hash order. Existing
+  `model_version` 2 models stay valid; no rebuild needed.
+
 ## [0.2.0] — 2026-10-07
 
 ### ⚠ Model incompatibility — rebuild all models

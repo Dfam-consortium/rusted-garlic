@@ -1,7 +1,7 @@
 use rand::distributions::WeightedIndex;
 use rand::prelude::*;
 use std::cmp;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::collections::VecDeque;
 use std::fs::File;
 use std::io::Read;
@@ -93,7 +93,8 @@ pub struct SeqModel {
     /// Per-bin k-mer totals (+1 per possible k-mer, as Perl's `loadKmers`);
     /// weights for drawing a random GC bin (Perl's `newGC()`).
     gc_kmer_totals: Vec<f64>,
-    gc_binned_kmer_flank_freqs: Vec<HashMap<String, [f64; 4]>>,
+    /// BTreeMap so the serialized model is byte-identical across runs.
+    gc_binned_kmer_flank_freqs: Vec<BTreeMap<String, [f64; 4]>>,
     pub repeat_model: Option<RepeatModel>,
 }
 
@@ -215,7 +216,14 @@ impl SeqModel {
     /// When `emit_cfg` is provided and the model contains a repeat profile,
     /// interspersed and simple repeats are inserted after the base sequence is
     /// generated (inserted regions are lower-cased).
-    pub fn emit(&self, seq_size: Option<usize>, emit_cfg: Option<&EmitConfig>) -> (String, Vec<InsertRecord>) {
+    ///
+    /// All randomness is drawn from `rng`, so a seeded RNG gives reproducible output.
+    pub fn emit(
+        &self,
+        seq_size: Option<usize>,
+        emit_cfg: Option<&EmitConfig>,
+        rng: &mut impl Rng,
+    ) -> (String, Vec<InsertRecord>) {
         // Build weighted samplers from the stored kmer frequencies.
         let mut gc_kmer_prefix_weights: Vec<HashMap<String, WeightedIndex<f64>>> = Vec::new();
         for _v in self.gc_ranges.iter() {
@@ -238,12 +246,10 @@ impl SeqModel {
             gc_to_gc_weights.push(WeightedIndex::new(&w).unwrap());
         }
 
-        let mut rng = thread_rng();
-
         // Sample initial GC bin weighted by bin window-count (Perl's newGC()).
         let gc_bin_counts: Vec<u32> = self.gc_ranges.iter().map(|r| r.count).collect();
         let gc_bin_dist = WeightedIndex::new(&gc_bin_counts).unwrap();
-        let mut current_gc_bin = gc_bin_dist.sample(&mut rng);
+        let mut current_gc_bin = gc_bin_dist.sample(rng);
 
         let bp_to_gen: usize = seq_size.unwrap_or(self.source_sequence_size);
         let mut out_bytes: Vec<u8> = Vec::with_capacity(bp_to_gen + 1);
@@ -253,7 +259,9 @@ impl SeqModel {
         gc_bins.push(current_gc_bin as u32); // window 0
 
         // Seed with a random (k-1)-mer prefix from the starting bin (Perl's $fseed).
-        let prefixes: Vec<&String> = gc_kmer_prefix_weights[current_gc_bin].keys().collect();
+        // Sorted: HashMap order varies between runs and would defeat a fixed seed.
+        let mut prefixes: Vec<&String> = gc_kmer_prefix_weights[current_gc_bin].keys().collect();
+        prefixes.sort();
         let seed_prefix = prefixes[rng.gen_range(0..prefixes.len())].clone();
         out_bytes.extend_from_slice(seed_prefix.as_bytes());
 
@@ -277,11 +285,11 @@ impl SeqModel {
                     let nextbase = gc_kmer_prefix_weights[current_gc_bin]
                         .get(km)
                         .expect("missing kmer prefix in model")
-                        .sample(&mut rng);
+                        .sample(rng);
                     s.push(b"ACGT"[nextbase]);
                 }
                 out_bytes.extend_from_slice(&s);
-                current_gc_bin = gc_to_gc_weights[current_gc_bin].sample(&mut rng);
+                current_gc_bin = gc_to_gc_weights[current_gc_bin].sample(rng);
                 i += self.win_size;
             }
             if out_bytes.len() > bp_to_gen {
@@ -299,7 +307,7 @@ impl SeqModel {
                 let nextbase = gc_kmer_prefix_weights[current_gc_bin]
                     .get(&km)
                     .expect("missing kmer prefix in model")
-                    .sample(&mut rng);
+                    .sample(rng);
                 let b: u8 = match nextbase {
                     0 => b'A',
                     1 => b'C',
@@ -312,7 +320,7 @@ impl SeqModel {
                 km.remove(0);
                 // Transition GC bin every win_size bases (Perl's createSeq outer loop).
                 if out_bytes.len() % self.win_size == 0 {
-                    current_gc_bin = gc_to_gc_weights[current_gc_bin].sample(&mut rng);
+                    current_gc_bin = gc_to_gc_weights[current_gc_bin].sample(rng);
                     gc_bins.push(current_gc_bin as u32);
                 }
             }
@@ -336,7 +344,7 @@ impl SeqModel {
                         self,
                         cfg.te_frac,
                         soft,
-                        &mut rng,
+                        rng,
                         cfg.perl_compat,
                     );
                     all_records.extend(recs);
@@ -353,7 +361,7 @@ impl SeqModel {
                     self,
                     cfg.sim_frac,
                     soft,
-                    &mut rng,
+                    rng,
                     cfg.perl_compat,
                 );
                 all_records.extend(recs);
@@ -1169,7 +1177,7 @@ impl SeqModel {
 
         // Initialize a hashes to hold per-gc-bin kmer flanking base frequencies
         for _v in seq_model.gc_ranges.iter() {
-            let hm: HashMap<String, [f64; 4]> = HashMap::new();
+            let hm: BTreeMap<String, [f64; 4]> = BTreeMap::new();
             seq_model.gc_binned_kmer_flank_freqs.push(hm);
         }
 

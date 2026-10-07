@@ -9,6 +9,7 @@ pub mod seq_model;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use log::{error, info, warn};
 use masking::MaskSet;
+use rand::{rngs::StdRng, SeedableRng};
 use seq_model::{EmitConfig, ModelConfig, SeqModel};
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -249,6 +250,11 @@ struct EmitArgs {
     /// Write a BED file of inserted repeat locations alongside the sequence
     #[arg(long = "out_bed", value_name = "BED_FILE")]
     out_bed: Option<PathBuf>,
+
+    /// Random seed; the same seed, model, inputs and version give identical output
+    ///   [default: random; the seed used is logged]
+    #[arg(long, value_name = "INT")]
+    seed: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -435,10 +441,16 @@ fn run_emit(args: EmitArgs) {
         None => None,
     };
 
+    // --- Random number generator --------------------------------------------
+    // One seeded RNG drives everything (consensus IUPAC resolution included) so
+    // --seed reproduces a run exactly.
+    let seed = args.seed.unwrap_or_else(rand::random);
+    info!("Random seed: {}", seed);
+    let mut rng = StdRng::seed_from_u64(seed);
+
     // --- Load legacy TE consensus if provided --------------------------------
     let consensus_map = args.te_cons.as_deref().map(|path| {
         info!("Loading TE consensus sequences from {:?}...", path);
-        let mut rng = rand::thread_rng();
         let map = consensus::load_fasta(path, &mut rng);
         info!("  {} consensus sequences loaded", map.len());
         map
@@ -476,7 +488,7 @@ fn run_emit(args: EmitArgs) {
             info!("Generating sequence...");
         }
 
-        let (seq, records) = model.emit(seq_size, Some(&emit_cfg));
+        let (seq, records) = model.emit(seq_size, Some(&emit_cfg), &mut rng);
         info!("Writing {} bp ({})...", seq.len(), seq_name);
 
         writeln!(fasta_writer, ">{}", seq_name).expect("Write error");

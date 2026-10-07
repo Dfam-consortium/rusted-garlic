@@ -22,6 +22,10 @@ cargo build --release
 
 The binary is at `target/release/rusted-garlic`.
 
+Run the tests with `cargo test --release`. `tests/determinism.rs` checks that `build`
+and seeded `emit` reproduce the golden files in `tests/data/golden/`; see
+`tests/data/README.md` for how to update them after an intended output change.
+
 ### Dependencies
 
 All dependencies are declared in `Cargo.toml` and fetched automatically by Cargo:
@@ -289,6 +293,7 @@ rusted-garlic emit --model <MODEL_FILE> --out_seq <FASTA_FILE> [OPTIONS]
 | `--no_soft_mask` | off | Keep inserted repeats uppercase (default: lower-case) |
 | `--perl_compat` | off | Reproduce known GARLIC 1.4 bugs, for side-by-side comparison with the Perl version (see below) |
 | `--out_bed <BED_FILE>` | — | Write legacy bombardment repeat insertion records as a 6-column BED file |
+| `--seed <INT>` | random | Random seed. The same seed, model, inputs and rusted-garlic version reproduce the output exactly. The seed used is always logged. |
 
 #### Insertion modes *(planned)*
 

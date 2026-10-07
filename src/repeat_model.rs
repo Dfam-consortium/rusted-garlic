@@ -3,7 +3,7 @@
 /// Mirrors the Perl `profileRMAlign` / `profileTRF` / `parseRepeats` logic in
 /// `createModel.pl`.  The profile is stored per GC bin (indexed 0..num_bins-1)
 /// and serialised alongside the sequence model in the JSON model file.
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::BufRead;
 use std::path::Path;
 
@@ -131,7 +131,8 @@ pub struct RepeatModel {
     /// `simple_profile[gc_bin]` = all simple repeat records assigned to that bin
     pub simple_profile: Vec<Vec<SimpleRepeat>>,
     /// `insert_table[gc_bin][outer_type#family][inner_type#family]` = frequency
-    pub insert_table: Vec<HashMap<String, HashMap<String, f64>>>,
+    /// (BTreeMap: deterministic serialization and sampling order)
+    pub insert_table: Vec<BTreeMap<String, BTreeMap<String, f64>>>,
 }
 
 impl RepeatModel {
@@ -139,7 +140,7 @@ impl RepeatModel {
         RepeatModel {
             te_profile: vec![Vec::new(); num_bins],
             simple_profile: vec![Vec::new(); num_bins],
-            insert_table: vec![HashMap::new(); num_bins],
+            insert_table: vec![BTreeMap::new(); num_bins],
         }
     }
 
@@ -363,7 +364,13 @@ pub fn profile_repeats(
     crate::io::sort_and_merge(&mut te_intervals);
 
     // Assign each accumulated repeat instance to a GC bin, applying gene filter.
-    for rd in repdata.values() {
+    // Genomic order (rep_id breaks ties), not HashMap order, so te_profile is
+    // the same on every run.
+    let mut repdata: Vec<(String, RepData)> = repdata.into_iter().collect();
+    repdata.sort_by(|(ka, a), (kb, b)| {
+        (&a.seq_id, a.ini, a.end, ka).cmp(&(&b.seq_id, b.ini, b.end, kb))
+    });
+    for (_, rd) in repdata.iter() {
         // Apply gene filter: skip if this TE overlaps a gene region.
         if let Some(gf) = gene_filter {
             if let Some(gene_ivs) = gf.get(&rd.seq_id) {
@@ -389,7 +396,7 @@ pub fn profile_repeats(
             if total == 0 {
                 continue;
             }
-            let freq_map: HashMap<String, f64> = inner_map
+            let freq_map: BTreeMap<String, f64> = inner_map
                 .into_iter()
                 .map(|(k, v)| (k, v as f64 / total as f64))
                 .collect();
