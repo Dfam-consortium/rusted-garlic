@@ -14,6 +14,16 @@ All notable changes to rusted-garlic. Validation details: `../tier2/README.md` a
 
 ### Changed
 
+- `build --perl_compat`: GC binning and TE bin positions follow GARLIC 1.4 exactly
+  (`calcBinGC`/`classGC`/`profileRMAlign`). On chr22 the GC bins, all 625 GC
+  transition counts, and the TE, simple-repeat and nested-insert tables are then
+  identical to GARLIC 1.4. Intended for validation; to be removed eventually.
+- Smoothed window GC is now the mean of the neighbours' full-precision GC, rounded
+  once (was: mean of values already rounded to 0.1%). As Perl.
+- A chromosome's trailing partial window no longer counts as a window in the GC
+  histogram, bin counts or transitions; it is still binned by its own GC.
+- K-mers are binned by the window of their first base (was: last base), as Perl.
+- Models built with earlier versions remain loadable; rebuild to pick up the changes.
 - `build` output is now byte-identical across runs. Model maps are written in sorted
   key order and TE records in genomic order instead of hash order. Existing
   `model_version` 2 models stay valid; no rebuild needed.

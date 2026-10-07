@@ -157,6 +157,14 @@ impl RepeatModel {
 // GC bin lookup helper
 // ---------------------------------------------------------------------------
 
+/// TE GC-bin position as GARLIC 1.4 `profileRMAlign` (`--perl_compat`):
+/// `ini + int((end - ini) / 2)` with Perl's 1-based `ini`, used as a 0-based
+/// position.  Takes 0-based half-open coordinates.
+fn perl_mid(ini: u32, end: u32) -> u32 {
+    let ini1 = ini + 1;
+    ini1 + end.saturating_sub(ini1) / 2
+}
+
 /// Returns the smoothed GC bin index for a given (seq_id, 0-based position).
 /// Returns None when the chromosome is unknown or the window is out of range.
 pub fn get_gc_bin(
@@ -225,8 +233,13 @@ pub fn profile_repeats(
     num_bins: usize,
     model: &mut RepeatModel,
     gene_filter: Option<&IntervalMap>,
+    perl_compat: bool,
 ) -> IntervalMap {
     let reader = crate::io::open_reader(path.as_ref());
+    // Position that picks a TE's GC bin: the midpoint of its span, or Perl's.
+    let te_pos = |ini: u32, end: u32| {
+        if perl_compat { perl_mid(ini, end) } else { ini + end.saturating_sub(ini) / 2 }
+    };
 
     // Accumulates per-instance data while streaming.
     // Key: rep_id; value: accumulated record built from one or more fragments.
@@ -234,6 +247,7 @@ pub fn profile_repeats(
         label: String,    // semicolon-joined fragment params
         ini: u32,         // earliest genomic start (0-based)
         end: u32,         // latest genomic end (0-based half-open)
+        last_end: u32,    // end of the last fragment read (Perl's 'end'; sets the GC-bin position)
         seq_id: String,
         type_fam: String, // "name#family"
     }
@@ -304,7 +318,7 @@ pub fn profile_repeats(
                     }
                 }
             }
-            let pos = ini + (end.saturating_sub(ini)) / 2;
+            let pos = te_pos(ini, end);
             let gc = match get_gc_bin(chrom_gc_bins, seq_id, pos, win_size) {
                 Some(g) => g as usize,
                 None => continue,
@@ -319,7 +333,8 @@ pub fn profile_repeats(
         // of the same rep_id are nested inside that repeat.
         if let Some(&prev_row) = id_last_row.get(rep_id) {
             if let Some(rd) = repdata.get(rep_id) {
-                let pos = rd.ini + (end.saturating_sub(rd.ini)) / 2;
+                // Perl uses the current fragment's end; default uses the span so far.
+                let pos = te_pos(rd.ini, if perl_compat { end } else { end.max(rd.end) });
                 if let Some(gc_bin) = get_gc_bin(chrom_gc_bins, rd.seq_id.as_str(), pos, win_size) {
                     let outer = rd.type_fam.clone();
                     for ln in (prev_row + 1)..cur_row {
@@ -350,11 +365,13 @@ pub fn profile_repeats(
                 if end > rd.end {
                     rd.end = end;
                 }
+                rd.last_end = end;
             })
             .or_insert_with(|| RepData {
                 label: fragment_label,
                 ini,
                 end,
+                last_end: end,
                 seq_id: seq_id.to_string(),
                 type_fam,
             });
@@ -379,7 +396,7 @@ pub fn profile_repeats(
                 }
             }
         }
-        let pos = rd.ini + (rd.end.saturating_sub(rd.ini)) / 2;
+        let pos = te_pos(rd.ini, if perl_compat { rd.last_end } else { rd.end });
         let gc = match get_gc_bin(chrom_gc_bins, &rd.seq_id, pos, win_size) {
             Some(g) => g as usize,
             None => continue,

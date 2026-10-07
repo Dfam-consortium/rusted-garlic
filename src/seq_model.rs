@@ -17,6 +17,98 @@ use crate::masking::MaskSet;
 use crate::repeat_model::{profile_repeats, profile_trf, RepeatModel};
 use crate::evolve::{insert_te_repeats, insert_simple_repeats, InsertRecord};
 
+/// Equal-population GC bin cuts (per mille), as GARLIC 1.4 `calcBinGC`.
+///
+/// `hist[v]` counts windows with `int(1000 * gc) == v`.  A cut is placed at each
+/// GC value `v` where `int(cumulative[v] / (total / num_bins))` increases; the
+/// first cut is 0 and the last is 1000.  Bin `k` spans `cuts[k]..cuts[k + 1]`.
+/// Buckets skipped in one step (a single value holding more than a bucket's
+/// worth of windows) are merged, so there can be fewer than `num_bins` bins.
+fn gc_bin_cuts(hist: &[u32; 1001], num_bins: usize) -> Vec<u32> {
+    let total: u64 = hist.iter().map(|&c| c as u64).sum();
+    assert!(total > 0, "no sequence windows with A/C/G/T to define GC bins");
+    // Perl iterates up to the highest GC value observed.
+    let max_v = hist.iter().rposition(|&c| c > 0).unwrap_or(0);
+    let size = total as f64 / num_bins as f64;
+    let mut cuts: Vec<u32> = Vec::new();
+    let (mut cum, mut prev_bucket) = (0u64, -1i64);
+    for (v, &c) in hist.iter().enumerate().take(max_v + 1) {
+        cum += c as u64;
+        let bucket = (cum as f64 / size) as i64;
+        if bucket > prev_bucket {
+            cuts.push(if v < max_v { v as u32 } else { 1000 });
+            prev_bucket = bucket;
+        }
+    }
+    // Perl leaves the windows above the last cut unbinned if float rounding keeps
+    // the final bucket from increasing; close the range at 1000 instead.
+    if *cuts.last().unwrap() != 1000 {
+        cuts.push(1000);
+    }
+    // Perl yields no bins at all when every window is below 0.1% GC (the only
+    // cut is 1000); use a single 0-1000 bin.
+    if cuts[0] != 0 {
+        cuts.insert(0, 0);
+    }
+    cuts
+}
+
+/// GC bin of a smoothed GC fraction: rounded to 0.1% (as Perl `classGC`'s
+/// `sprintf "%0.3f"`), then the last bin whose start is at or below it.  A value
+/// equal to a bin start belongs to that bin, matching `classGC`.
+fn gc_bin_of(gc: f64, bin_starts: &[u32]) -> usize {
+    let permille = (format!("{:.3}", gc).parse::<f64>().unwrap() * 1000.0).round() as u32;
+    bin_starts.partition_point(|&s| s <= permille).saturating_sub(1)
+}
+
+/// Equal-population GC bins (the default).
+///
+/// Tries `num_bins`, then fewer, until every bin is non-empty: with target size
+/// `T = ceil(total / ts)`, GC value `v` goes to bin `ceil(cumulative[v] / T) - 1`.
+/// A GC value holding more than one bin's worth of windows therefore lowers the
+/// bin count rather than producing one oversized bin, keeping populations even.
+///
+/// Returns each bin's start (lowest observed GC, per mille; used for assignment)
+/// and its displayed range, whose boundaries are the midpoints between adjacent
+/// bins' observed GC values.
+fn equal_population_bins(hist: &[u32; 1001], num_bins: usize) -> (Vec<u32>, Vec<GCRange>) {
+    let mut cum = [0u64; 1001];
+    let mut acc = 0u64;
+    for v in 0..=1000 {
+        acc += hist[v] as u64;
+        cum[v] = acc;
+    }
+    let total = cum[1000];
+    assert!(total > 0, "no sequence windows with A/C/G/T to define GC bins");
+    for ts in (1..=num_bins).rev() {
+        let target = (total as f64 / ts as f64).ceil();
+        let mut starts: Vec<Option<u32>> = vec![None; ts];
+        let mut max_seen = vec![0u32; ts];
+        let mut counts = vec![0u64; ts];
+        for v in 0..=1000usize {
+            if hist[v] == 0 {
+                continue;
+            }
+            let bin = (cum[v] as f64 / target).ceil() as usize - 1;
+            starts[bin].get_or_insert(v as u32);
+            max_seen[bin] = v as u32;
+            counts[bin] += hist[v] as u64;
+        }
+        if counts.iter().any(|&c| c == 0) {
+            continue;
+        }
+        let starts: Vec<u32> = starts.into_iter().map(|s| s.unwrap()).collect();
+        let mut ranges: Vec<GCRange> = Vec::with_capacity(ts);
+        for k in 0..ts {
+            let start = if k == 0 { starts[0] } else { (max_seen[k - 1] + starts[k]) / 2 };
+            let end = if k + 1 == ts { 1000 } else { (max_seen[k] + starts[k + 1]) / 2 };
+            ranges.push(GCRange { start, end, count: 0 });
+        }
+        return (starts, ranges);
+    }
+    unreachable!("a single bin always has windows")
+}
+
 /// Configuration for `SeqModel::emit()` controlling repeat bombardment.
 pub struct EmitConfig<'a> {
     /// Map from TE consensus name → DNA bytes (from a RepeatMaskerLib FASTA).
@@ -57,6 +149,9 @@ pub struct ModelConfig<'a> {
     /// Drop tandem repeats fully contained in a TE interval when profiling
     /// simple repeats.  Off by default (Perl's `profileTRF` keeps them).
     pub filter_te_tandems: bool,
+    /// Reproduce GARLIC 1.4 GC binning (`calcBinGC`/`classGC`) and TE bin
+    /// positions exactly, for comparison with the Perl version.  Off by default.
+    pub perl_compat: bool,
 }
 
 #[derive(Debug, Copy, Clone, Serialize, Deserialize)]
@@ -419,9 +514,7 @@ impl SeqModel {
         seq_model.win_size = win_size;
         seq_model.kmer_size = kmer_size;
         let window_size = win_size;
-        let (raw, raw_size) = crate::io::open_raw(path.as_ref());
-        let est_windows: usize = raw_size / window_size;
-        let mut bingc: Vec<u32> = Vec::with_capacity(est_windows);
+        let (raw, _) = crate::io::open_raw(path.as_ref());
         let mut buf = BufReader::new(raw);
 
         let mut bytes = [0; 512];
@@ -429,90 +522,79 @@ impl SeqModel {
         let mut win_at_count = 0;
         let mut win_cg_count = 0;
         let mut win_bp_count = 0;
-        const NA_SENTINEL: u32 = 1001;
-        const SQ_SENTINEL: u32 = 1002;
-        let mut cumul_gc_win_counts = [0u32; (NA_SENTINEL + 1) as usize];
 
-        // Per-chromosome tracking for repeat profiling (Pass 3).
-        // chrom_names[k] = the sequence id whose SQ_SENTINEL is bingc[k_th_sentinel].
-        let mut chrom_names: Vec<String> = Vec::new();
+        let perl_compat = config.map_or(false, |c| c.perl_compat);
+
+        // Pass 1: raw GC of every window at full precision, a histogram of window
+        // GC in 0.1% slots (full windows only), then equal-population GC bins and
+        // smoothed per-window bin assignments (below).
+        //
+        // `perl_compat` follows GARLIC 1.4 calcBinGC/classGC exactly: histogram
+        // slot int(1000*gc) instead of rounding, and a trailing partial window is
+        // ignored with the chromosome's last full-window GC repeated in its place.
+        let mut gc_hist = [0u32; 1001];
+        // Per chromosome: name, raw GC per window (None = no A/C/G/T), and the
+        // number of full windows (a trailing entry may follow for the tail).
+        let mut chrom_raw_gc: Vec<(String, Vec<Option<f64>>, usize)> = Vec::new();
+        let mut cur_raw_gc: Vec<Option<f64>> = Vec::new();
+
         let mut p1_chr_name = String::new();
         let mut p1_in_header_name = false;
 
-        // Calculate:
-        //
-        //   bingc[]: GC content of "window_size" windows as a scaled fraction (to limit
-        //            the precision: int(cg_count/total_count * 1000).
-        //
-        //   cumul_gc_win_counts[]: Count of windows for each GC bin to later be converted
-        //                          into a cumulative count.
+        fn window_gc(cg: usize, at: usize) -> Option<f64> {
+            if cg + at > 0 { Some(cg as f64 / (cg + at) as f64) } else { None }
+        }
+        // Record a full window's raw GC.
+        fn push_window(cg: usize, at: usize, raw: &mut Vec<Option<f64>>, hist: &mut [u32; 1001],
+                       perl_compat: bool) {
+            let gc = window_gc(cg, at);
+            if let Some(g) = gc {
+                let slot = if perl_compat { (1000.0 * g) as usize } else { (1000.0 * g).round() as usize };
+                hist[slot] += 1;
+            }
+            raw.push(gc);
+        }
+        // Close a chromosome.  The trailing partial window (if any) gets its own
+        // GC; Perl instead repeats the last full window's GC, partial or not.
+        fn finish_chrom(name: &str, raw: &mut Vec<Option<f64>>, partial: Option<Option<f64>>,
+                        perl_compat: bool, out: &mut Vec<(String, Vec<Option<f64>>, usize)>) {
+            let n_full = raw.len();
+            if perl_compat {
+                let last = raw.last().copied().flatten();
+                raw.push(last);
+            } else if let Some(gc) = partial {
+                raw.push(gc);
+            }
+            out.push((name.to_string(), std::mem::take(raw), n_full));
+        }
+
         loop {
             match buf.read(&mut bytes) {
                 // EOF Reached
                 Ok(0) => {
-                    // Process partial window
-                    if win_bp_count > 0 {
-                        // NOTE: Garlic uses GC of the previous window...as the
-                        //       trailing case. I am not sure if this was to avoid
-                        //       calling GC if the window was small ( e.g one bp ).
-                        let mut gc = NA_SENTINEL;
-                        let acgt_count = win_cg_count + win_at_count;
-                        // Perhaps only calculate GC iff there is enough data and use previous
-                        // GC otherwise
-                        if acgt_count > 0 {
-                            gc = ((win_cg_count as f64 / acgt_count as f64) * 1000.0).round() as u32;
-                        }
-
-                        // To simulate GARLIC approach
-                        //if let Some(val) = bingc.last() {
-                        //  gc = val;
-                        //}
-
-                        // Emit a window
-                        bingc.push(gc);
-                        cumul_gc_win_counts[gc as usize] += 1;
+                    if win_bp_count == window_size {
+                        push_window(win_cg_count, win_at_count, &mut cur_raw_gc, &mut gc_hist, perl_compat);
+                        win_bp_count = 0;
                     }
-                    // Emit sequence end sentinel
-                    bingc.push(SQ_SENTINEL);
-                    chrom_names.push(p1_chr_name.clone());
+                    if !p1_chr_name.is_empty() || !cur_raw_gc.is_empty() {
+                        let partial = (win_bp_count > 0).then(|| window_gc(win_cg_count, win_at_count));
+                        finish_chrom(&p1_chr_name, &mut cur_raw_gc, partial, perl_compat, &mut chrom_raw_gc);
+                    }
                     break;
                 }
                 Ok(n) => {
                     for i in 0..n {
-                        //num_bytes += 1;
-
                         if win_bp_count == window_size {
-                            let mut gc = NA_SENTINEL;
-                            let acgt_count = win_cg_count + win_at_count;
-                            if acgt_count > 0 {
-                                gc = ((win_cg_count as f64 / acgt_count as f64) * 1000.0).round() as u32;
-                            }
-                            // Emit a window
-                            bingc.push(gc);
-                            cumul_gc_win_counts[gc as usize] += 1;
+                            push_window(win_cg_count, win_at_count, &mut cur_raw_gc, &mut gc_hist, perl_compat);
                             win_at_count = 0;
                             win_cg_count = 0;
                             win_bp_count = 0;
                         }
 
                         if bytes[i] == '>' as u8 {
-                            // Process partial window
-                            if win_bp_count > 0 {
-                                // See EOF section about trailing cases
-                                let mut gc = NA_SENTINEL;
-                                let acgt_count = win_cg_count + win_at_count;
-                                if acgt_count > 0 {
-                                    gc =
-                                        ((win_cg_count as f64 / acgt_count as f64) * 1000.0).round() as u32;
-                                }
-                                bingc.push(gc);
-                                cumul_gc_win_counts[gc as usize] += 1;
-                            }
-                            // Always emit sequence end sentinel (fixes chromosome
-                            // boundary tracking when a chr ends on a window edge).
-                            if !p1_chr_name.is_empty() || !bingc.is_empty() {
-                                bingc.push(SQ_SENTINEL);
-                                chrom_names.push(p1_chr_name.clone());
+                            if !p1_chr_name.is_empty() || !cur_raw_gc.is_empty() {
+                                let partial = (win_bp_count > 0).then(|| window_gc(win_cg_count, win_at_count));
+                                finish_chrom(&p1_chr_name, &mut cur_raw_gc, partial, perl_compat, &mut chrom_raw_gc);
                             }
                             in_header = true;
                             p1_in_header_name = true;
@@ -691,286 +773,52 @@ impl SeqModel {
             println!(" Total: {}", seq_model.source_sequence_size);
         }
 
-        // Read stats
-        //let dur = t1.elapsed().as_secs_f64();
-        //let num_bytes = (num_bytes as f64) / 1_048_576f64;
-        //println!(
-        //    "Read speed, Pass 1: {:.1} MiB / s for {}",
-        //    num_bytes / dur,
-        //    num_bytes
-        //);
-
-        // Currently cumul_gc_win_counts contains absolute counts of windows
-        // for each gc value 0-1000,NA_SENTINEL.  Convert this to a cumulative
-        // count from gc=0-1000 inplace.
-        let mut min_gc = 1000;
-        let mut max_gc = 0;
-        if cumul_gc_win_counts[0 as usize] > 0 {
-            min_gc = 0;
-        }
-        for v in 1..NA_SENTINEL {
-            if cumul_gc_win_counts[v as usize] > 0 {
-                if v < min_gc {
-                    min_gc = v;
-                }
-                max_gc = v;
-            }
-            cumul_gc_win_counts[v as usize] += cumul_gc_win_counts[(v - 1) as usize];
-        }
-
-        println!(
-            "min_gc = {}, max_gc = {} dynamic_range={}",
-            min_gc,
-            max_gc,
-            max_gc - min_gc + 1
-        );
-        println!("max_bins = {}", (max_gc - min_gc + 1 / 25) + 1);
-        println!(
-            "new max bins = {}",
-            std::cmp::min((max_gc - min_gc + 1 / 25) + 1, 25)
-        );
-
-        let _new_target = std::cmp::min((max_gc - min_gc + 1 / 25) + 1, 25);
-
-        // Identify the GC ranges that divide the genome into MAX_GC_BUCKETS number
-        // of roughly equally sized groups of windows.
-        //
-        // Calculates:
-        //   gc_ranges[] : A vector of structures containing start, end and bp count for each
-        //                 generated range.
-        //   gc_lookup[] : A convenience vector to lookup bins by any scaled GC value.
-        //
-        let mut gc_lookup = vec![0u32; SQ_SENTINEL as usize];
-        let mut local_gc_ranges: Vec<GCRange> =
-            vec![GCRange { start: 0, end: 0, count: 0 }; max_gc_bins];
-        // Tracks the highest GC value (0–1000 scale) that has at least one window
-        // in each bin for the current ts trial.  Used to compute midpoint boundaries.
-        let mut bin_actual_max = vec![0u32; max_gc_bins];
-        let mut bad = 0;
-        let mut num_buckets: u32 = 0;
-        for ts in (1..=max_gc_bins as u32).rev() {
-            num_buckets = ts;
-            for r in local_gc_ranges.iter_mut() {
-                *r = GCRange { start: 0, end: 0, count: 0 };
-            }
-            for m in bin_actual_max.iter_mut() { *m = 0; }
-            println!("Trying bin count = {}", ts);
-            let target_bin_size = (cumul_gc_win_counts[1000] as f64 / ts as f64).ceil() as u32;
-            println!(
-                "cumul_gc_win_counts[1000] = {} , target_bin_size = {}",
-                cumul_gc_win_counts[1000], target_bin_size
-            );
-            let mut prev_bin = 10000000;
-            for v in 0..NA_SENTINEL {
-                let mut bin = 0;
-                if cumul_gc_win_counts[v as usize] > 0 {
-                    bin = ((cumul_gc_win_counts[v as usize] as f64 / target_bin_size as f64).ceil()
-                        - 1.0)
-                        .abs() as u32;
-                }
-                if bin != prev_bin {
-                    println!(
-                        "  - bin switch @{} counts={}",
-                        v, cumul_gc_win_counts[v as usize]
-                    );
-                }
-                gc_lookup[v as usize] = bin;
-                // Track the highest GC score that has actual windows in each bin.
-                let window_count_at_v = cumul_gc_win_counts[v as usize]
-                    - if v > 0 { cumul_gc_win_counts[(v - 1) as usize] } else { 0 };
-                if window_count_at_v > 0 {
-                    bin_actual_max[bin as usize] = v;
-                }
-                if local_gc_ranges[bin as usize].count > 0 {
-                    local_gc_ranges[bin as usize].count +=
-                        cumul_gc_win_counts[v as usize] - cumul_gc_win_counts[(v - 1) as usize];
-                } else {
-                    local_gc_ranges[bin as usize].start = v;
-                    if v == 0 {
-                        local_gc_ranges[bin as usize].count = cumul_gc_win_counts[v as usize];
-                    } else {
-                        local_gc_ranges[bin as usize].count =
-                            cumul_gc_win_counts[v as usize] - cumul_gc_win_counts[(v - 1) as usize];
-                    }
-                }
-                prev_bin = bin;
-            }
-            bad = 0;
-            for v in 0..ts as usize {
-                println!(
-                    "bin[{}]:  {:.3} to {:.3} (inclusive) [len={}]",
-                    v,
-                    (local_gc_ranges[v].start as f64 / 1000 as f64),
-                    (local_gc_ranges[v].end as f64 / 1000 as f64),
-                    local_gc_ranges[v].count
-                );
-                if local_gc_ranges[v].count == 0 {
-                    bad = 1;
-                }
-                if v > 0 && local_gc_ranges[v].start <= local_gc_ranges[v - 1].start {
-                    bad = 1;
-                }
-                if v > 0 && local_gc_ranges[v].start > local_gc_ranges[v - 1].start {
-                    local_gc_ranges[v - 1].end = local_gc_ranges[v].start - 1;
-                }
-            }
-            local_gc_ranges[(ts - 1) as usize].end = 1000 as u32;
-            if bad == 0 {
-                break;
-            }
-            // TODO: Calculate the max GC range for all bins...and warn if it seems excessive
-        }
-        if bad == 1 {
-            panic!("Could not identify a GC bucket count that satisfies the constraints of zero-empty buckets, and .1% seperation between buckets");
-        }
-        // Sentinel value for "no bin" — equals actual_bins (one past last valid index).
-        let actual_bins = num_buckets as usize;
-        gc_lookup[NA_SENTINEL as usize] = actual_bins as u32;
-
-        // Refine bin boundaries to midpoints between observed GC clusters.
-        //
-        // The raw boundary is  end[i] = start[i+1] - 1, which can look arbitrary when
-        // the two neighbouring bins have a large gap between their observed GC values
-        // (e.g. bins at 0 % and 100 % get "0–99.9%" and "100–100%" instead of the
-        // cleaner "0–50%" and "50–100%").  Using the midpoint makes the ranges easier
-        // to interpret without changing which windows fall in which bin (the gc_lookup
-        // table governs actual assignment and is unaffected).
-        let original_starts: Vec<u32> = local_gc_ranges[..actual_bins].iter().map(|r| r.start).collect();
-        for i in 0..actual_bins - 1 {
-            let midpoint = (bin_actual_max[i] + original_starts[i + 1]) / 2;
-            local_gc_ranges[i].end = midpoint;
-            local_gc_ranges[i + 1].start = midpoint;
-        }
-        local_gc_ranges[actual_bins - 1].end = 1000;
-
-        // Copy valid GC range boundaries into the model (counts recomputed in smoothing pass).
-        seq_model.gc_ranges = local_gc_ranges[..actual_bins]
-            .iter()
-            .map(|r| GCRange { start: r.start, end: r.end, count: 0 })
-            .collect();
+        // GC bins: `bin_starts[k]` is the lowest GC (per mille) assigned to bin k.
+        let (bin_starts, gc_ranges) = if perl_compat {
+            let cuts = gc_bin_cuts(&gc_hist, max_gc_bins);
+            let ranges = cuts.windows(2).map(|c| GCRange { start: c[0], end: c[1], count: 0 }).collect();
+            (cuts[..cuts.len() - 1].to_vec(), ranges)
+        } else {
+            equal_population_bins(&gc_hist, max_gc_bins)
+        };
+        let actual_bins = bin_starts.len();
+        let sentinel_bin = actual_bins as u32; // "no bin" (window without A/C/G/T)
+        seq_model.gc_ranges = gc_ranges;
         seq_model.gc_trans = vec![vec![0.0f64; actual_bins]; actual_bins];
 
-        if print_garlic {
-            println!("Initial bin counts");
-            for v in 0..actual_bins {
-                println!(
-                    "bin[{}]:  {:.3} to {:.3} (inclusive) [len={}]",
-                    v,
-                    (local_gc_ranges[v].start as f64 / 1000 as f64),
-                    (local_gc_ranges[v].end as f64 / 1000 as f64),
-                    local_gc_ranges[v].count
-                );
-            }
-        }
-
-        // Calculate the smoothed GC content of each window and update the GC range counts
-        // This alters gc_lookup using the smoothed GC window values.
-
-        // Counts are recomputed during the smoothing pass below.
-        const FLANK_WINDOWS: usize = 5;
-        let mut next_dest_idx = 0;
-        let mut gc_queue: VecDeque<u32> = VecDeque::with_capacity(14);
-        let mut gc_sum = 0;
-        let mut gc_cnt = 0;
-        let sentinel_bin = actual_bins as u32; // "no bin" sentinel value
-        let mut prev_gc_bin = sentinel_bin;
-
-        // chrom_gc_bins[chrom] = smoothed GC bin index for each 1kb window.
-        // Used by the repeat profiler to look up GC bin at any genomic position.
+        // Smooth each window's raw GC over +/- flank windows (full precision,
+        // rounded once to 0.1%), assign bins, and count transitions between
+        // consecutive full windows.  Perl's flank is int((10 kb / win) / 2).
+        let flank = if perl_compat { (10_000 / win_size) / 2 } else { 5 };
+        // chrom_gc_bins[chrom][w] = smoothed GC bin of window w (sentinel_bin if none),
+        // including an entry for a trailing partial window.
         let mut chrom_gc_bins: HashMap<String, Vec<u32>> = HashMap::new();
-        let mut sentinel_idx: usize = 0; // index into chrom_names
-        let mut chr_windows: usize = 0; // windows pushed for the current chromosome
-
-        for i in 0..bingc.len() {
-            if bingc[i] == SQ_SENTINEL {
-                let cur_chrom = chrom_names.get(sentinel_idx).cloned().unwrap_or_default();
-                // Finish up the trailing windows for the current chromosome: the
-                // last min(windows, FLANK_WINDOWS) have not been emitted yet.  Window
-                // k averages windows max(0, k-FLANK)..end, so drop queue entries
-                // that fall left of that range before each emission.
-                let n_left = cmp::min(gc_queue.len(), FLANK_WINDOWS);
-                for t in 0..n_left {
-                    let k = chr_windows - n_left + t;
-                    while chr_windows - gc_queue.len() + FLANK_WINDOWS < k {
-                        let val = gc_queue.pop_front().unwrap();
-                        if val < NA_SENTINEL {
-                            gc_sum -= val;
-                            gc_cnt -= 1;
-                        }
-                    }
-                    let mut gc_avg = NA_SENTINEL;
-                    if gc_cnt > 0 {
-                        // Round (not truncate) the smoothed GC mean: truncation biases
-                        // every fractional value downward (~0.045% GC genome-wide). See
-                        // PERL_VS_RUST_DIFFS.md (floor→round change) — matches Perl classGC.
-                        gc_avg = (gc_sum as f64 / gc_cnt as f64).round() as u32;
-                    }
-                    let gc_bin = gc_lookup[gc_avg as usize];
-                    if prev_gc_bin != sentinel_bin && gc_bin != sentinel_bin {
-                        seq_model.gc_trans[prev_gc_bin as usize][gc_bin as usize] += 1.0 as f64;
-                    }
-                    prev_gc_bin = gc_bin;
-                    if gc_bin < sentinel_bin {
-                        seq_model.gc_ranges[gc_bin as usize].count += 1;
-                        bingc[next_dest_idx] = gc_bin;
-                    }
-                    // Always push so window index stays aligned (same fix as the
-                    // left-edge case above).
-                    chrom_gc_bins.entry(cur_chrom.clone()).or_default().push(gc_bin);
-                    next_dest_idx += 1;
+        for (name, raw, n_full) in &chrom_raw_gc {
+            let n = raw.len();
+            let mut bins: Vec<u32> = Vec::with_capacity(n);
+            for i in 0..n {
+                let (lo, hi) = (i.saturating_sub(flank), cmp::min(i + flank, n - 1));
+                let (mut sum, mut num) = (0.0f64, 0usize);
+                for g in raw[lo..=hi].iter().flatten() {
+                    sum += g;
+                    num += 1;
                 }
-                sentinel_idx += 1;
-                gc_sum = 0;
-                gc_cnt = 0;
-                prev_gc_bin = sentinel_bin;
-                gc_queue.clear();
-                chr_windows = 0;
-                continue;
+                let bin = if num > 0 { gc_bin_of(sum / num as f64, &bin_starts) as u32 } else { sentinel_bin };
+                bins.push(bin);
             }
-
-            if bingc[i] < NA_SENTINEL {
-                gc_sum += bingc[i];
-                gc_cnt += 1;
-            }
-            gc_queue.push_back(bingc[i]);
-            chr_windows += 1;
-
-            // Complete windows case:
-            // FLANK_WINDOWS .. |--------| .. FLANK_WINDOWS
-            if gc_queue.len() > ((FLANK_WINDOWS * 2) + 1) {
-                let val = gc_queue.pop_front().unwrap();
-                if val < NA_SENTINEL {
-                    gc_sum -= val;
-                    gc_cnt -= 1;
+            let full = &bins[..*n_full];
+            for &b in full {
+                if b < sentinel_bin {
+                    seq_model.gc_ranges[b as usize].count += 1;
                 }
             }
-
-            // left-edge case: flank on right reached
-            // |--------| .. FLANK_WINDOWS
-            if gc_queue.len() > FLANK_WINDOWS {
-                let mut gc_avg = NA_SENTINEL;
-                if gc_cnt > 0 {
-                    // Round (not truncate) the smoothed GC mean — see note above.
-                    gc_avg = (gc_sum as f64 / gc_cnt as f64).round() as u32;
+            for w in full.windows(2) {
+                if w[0] < sentinel_bin && w[1] < sentinel_bin {
+                    seq_model.gc_trans[w[0] as usize][w[1] as usize] += 1.0;
                 }
-                let gc_bin = gc_lookup[gc_avg as usize];
-                if prev_gc_bin != sentinel_bin && gc_bin != sentinel_bin {
-                    seq_model.gc_trans[prev_gc_bin as usize][gc_bin as usize] += 1.0 as f64;
-                }
-                prev_gc_bin = gc_bin;
-                let cur_chrom = chrom_names.get(sentinel_idx).cloned().unwrap_or_default();
-                if gc_bin < sentinel_bin {
-                    seq_model.gc_ranges[gc_bin as usize].count += 1;
-                }
-                // Always push (including sentinel_bin) so that chrom_gc_bins[w]
-                // corresponds to window index w within the chromosome —
-                // previously sentinel windows were skipped, causing an offset.
-                chrom_gc_bins.entry(cur_chrom).or_default().push(gc_bin);
-                bingc[next_dest_idx] = gc_bin;
-                next_dest_idx += 1;
             }
+            chrom_gc_bins.insert(name.clone(), bins);
         }
-        bingc.resize(next_dest_idx, NA_SENTINEL);
 
         // Print a summary of GC bins with their window counts and approximate base-pair
         // coverage.  This appears before Pass 2 so the user can sanity-check the input
@@ -1034,7 +882,7 @@ impl SeqModel {
         // GC-bin lookup helper: uses the per-chromosome smoothed bins built during
         // the smoothing pass.  This avoids indexing into bingc with a global base
         // counter — that approach accumulated a deficit of one slot per chromosome
-        // (due to SQ_SENTINEL entries) and panicked on genomes with many sequences.
+        // and panicked on genomes with many sequences.
         let gc_bin_for = |chr: &str, chr_pos: u32| -> usize {
             let win = chr_pos as usize / win_size;
             chrom_gc_bins
@@ -1049,7 +897,7 @@ impl SeqModel {
                 Ok(0) => {
                     // EOF: flush the last kmer if one is pending.
                     if kmer.len() == kmer_len && chr_bp_count >= kmer_len as u32 {
-                        let gc_bin = gc_bin_for(&chr_name, chr_bp_count - 1);
+                        let gc_bin = gc_bin_for(&chr_name, chr_bp_count - kmer_len as u32);
                         if gc_bin < actual_bins {
                             let s: String = kmer.iter().collect();
                             *maps[gc_bin].entry(s).or_default() += 1;
@@ -1064,7 +912,7 @@ impl SeqModel {
                         // chr_bp_count reflects all bases pushed so far in this chromosome;
                         // the most-recently-added base is at position chr_bp_count-1.
                         if kmer.len() == kmer_len && chr_bp_count >= kmer_len as u32 {
-                            let gc_bin = gc_bin_for(&chr_name, chr_bp_count - 1);
+                            let gc_bin = gc_bin_for(&chr_name, chr_bp_count - kmer_len as u32);
                             if gc_bin < actual_bins {
                                 let s: String = kmer.iter().collect();
                                 *maps[gc_bin].entry(s).or_default() += 1;
@@ -1151,7 +999,8 @@ impl SeqModel {
                 let te_ivs = if let Some(rpath) = cfg.te_annot_file {
                     log::info!("  Profiling TE repeats from {:?}...", rpath);
                     let te_ivs = profile_repeats(rpath, &chrom_gc_bins, win_size as u32,
-                                                 actual_bins, &mut rm, cfg.gene_filter);
+                                                 actual_bins, &mut rm, cfg.gene_filter,
+                                                 cfg.perl_compat);
                     log::info!("  {} TE records profiled", rm.te_count());
                     te_ivs
                 } else {
@@ -1397,6 +1246,7 @@ mod tests {
             kmer_size: 2,
             num_gc_bins,
             filter_te_tandems: false,
+            perl_compat: false,
         }
     }
 
@@ -1739,7 +1589,7 @@ mod tests {
     //
     //   3. Bin isolation
     //      Kmers from separate chromosomes are counted only in the GC bin of
-    //      the window containing their last base — they must not contaminate
+    //      the window containing their first base — they must not contaminate
     //      other bins.  When a prefix has no observed kmers in a bin, the code
     //      applies a GC-fraction fallback that differs from the data-driven 1.0.
     // -----------------------------------------------------------------------
@@ -1810,7 +1660,7 @@ mod tests {
 
     /// Two separate chromosomes (all-AT → bin 0, all-GC → bin 1).
     ///
-    /// Kmers are assigned to the bin of the window containing their last base,
+    /// Kmers are assigned to the bin of the window containing their first base,
     /// and each chromosome is uniform, so:
     ///   bin 0: only "AA" kmers counted → P(A | "A") = 1.0
     ///   bin 1: only "CC" kmers counted → P(C | "C") = 1.0
@@ -1912,5 +1762,111 @@ mod tests {
         let json = serde_json::to_string(&model).unwrap();
         let back = SeqModel::from_json(&json).expect("current model must load");
         assert_eq!(back.model_version, MODEL_FORMAT_VERSION);
+    }
+
+    // -----------------------------------------------------------------------
+    // Default vs --perl_compat GC binning
+    // -----------------------------------------------------------------------
+
+    fn hist(levels: &[(usize, u32)]) -> [u32; 1001] {
+        let mut h = [0u32; 1001];
+        for &(v, n) in levels {
+            h[v] = n;
+        }
+        h
+    }
+
+    /// A GC value holding more than one bin's worth of windows: the default
+    /// lowers the bin count so populations stay even; Perl keeps more bins but
+    /// one absorbs the spike.
+    #[test]
+    fn test_skewed_histogram_default_vs_perl() {
+        // 40 windows at 40.0% GC, then 10 each at 30, 50, 60 and 70%.
+        let h = hist(&[(300, 10), (400, 40), (500, 10), (600, 10), (700, 10)]);
+        let (starts, ranges) = equal_population_bins(&h, 8);
+        // 80 windows: 8..4 bins leave a bin empty (the spike spans several);
+        // 3 bins of target 27 work: 10 / 40 / 30 windows.
+        assert_eq!(starts, vec![300, 400, 500]);
+        let r: Vec<(u32, u32)> = ranges.iter().map(|r| (r.start, r.end)).collect();
+        assert_eq!(r, vec![(300, 350), (350, 450), (450, 1000)]);
+        // Perl keeps 5 bins: [0,300) is empty, [400,500) holds the spike (40),
+        // and [600,1000] takes the top two levels (20).
+        assert_eq!(gc_bin_cuts(&h, 8), vec![0, 300, 400, 500, 600, 1000]);
+    }
+
+    /// Perl cut rule: a cut wherever int(cumulative / (total / bins)) rises;
+    /// the first cut is 0 and the highest observed value closes at 1000.
+    #[test]
+    fn test_gc_bin_cuts_perl_rule() {
+        let h = hist(&[(100, 10), (300, 10), (500, 10), (700, 10)]);
+        assert_eq!(gc_bin_cuts(&h, 4), vec![0, 100, 300, 500, 1000]);
+        let h = hist(&[(200, 10), (400, 30), (600, 10)]);
+        assert_eq!(gc_bin_cuts(&h, 5), vec![0, 200, 400, 1000]);
+    }
+
+    /// Degenerate inputs where Perl yields no usable bins give one 0-1000 bin.
+    #[test]
+    fn test_gc_bin_cuts_degenerate() {
+        assert_eq!(gc_bin_cuts(&hist(&[(0, 20)]), 25), vec![0, 1000]);
+        assert_eq!(gc_bin_cuts(&hist(&[(500, 20)]), 25), vec![0, 1000]);
+        assert_eq!(gc_bin_cuts(&hist(&[(1000, 20)]), 25), vec![0, 1000]);
+    }
+
+    /// Rounded to 0.1%, then the last bin starting at or below the value.
+    #[test]
+    fn test_gc_bin_of() {
+        let starts = [0, 342, 365];
+        assert_eq!(gc_bin_of(0.0, &starts), 0);
+        assert_eq!(gc_bin_of(0.3414, &starts), 0);
+        assert_eq!(gc_bin_of(0.3416, &starts), 1, "rounds to 0.342 = start of bin 1");
+        assert_eq!(gc_bin_of(0.3649, &starts), 2, "rounds to 0.365");
+        assert_eq!(gc_bin_of(1.0, &starts), 2);
+        assert_eq!(gc_bin_of(0.1, &[300, 500]), 0, "below the first start -> bin 0");
+    }
+
+    /// --perl_compat on five GC levels: Perl's cuts, with the top level (100%)
+    /// sharing the 75% bin.
+    #[test]
+    fn test_perl_compat_five_levels() {
+        let tmp = std::env::temp_dir().join("garlic_test_perl_compat_bins.fa");
+        write_fasta(&tmp, &[
+            ("chr0",    make_sequence(0,    10, 100)),
+            ("chr250",  make_sequence(250,  10, 100)),
+            ("chr500",  make_sequence(500,  10, 100)),
+            ("chr750",  make_sequence(750,  10, 100)),
+            ("chr1000", make_sequence(1000, 10, 100)),
+        ]);
+        let mut cfg = basic_config(100, 25);
+        cfg.perl_compat = true;
+        let model = SeqModel::model(&tmp, Some(&cfg));
+        let _ = fs::remove_file(&tmp);
+
+        let ranges: Vec<(u32, u32, u32)> =
+            model.gc_ranges.iter().map(|r| (r.start, r.end, r.count)).collect();
+        assert_eq!(ranges, vec![(0, 250, 10), (250, 500, 10), (500, 750, 10), (750, 1000, 20)]);
+    }
+
+    /// A trailing partial window never counts as a window for bins or
+    /// transitions.  By default it is binned by its own GC (so repeats in the
+    /// tail use it); --perl_compat repeats the last full window's GC instead.
+    #[test]
+    fn test_partial_window() {
+        let tmp = std::env::temp_dir().join("garlic_test_partial_window.fa");
+        // chrA: 20 x 50% windows + a 60-bp all-C tail; chrB: 20 x 100% windows.
+        let mut a = make_sequence(500, 20, 100);
+        a.extend(vec![b'C'; 60]);
+        write_fasta(&tmp, &[("chrA", a), ("chrB", make_sequence(1000, 20, 100))]);
+
+        for perl_compat in [false, true] {
+            let mut cfg = basic_config(100, 2);
+            cfg.perl_compat = perl_compat;
+            let model = SeqModel::model(&tmp, Some(&cfg));
+            let counts: Vec<u32> = model.gc_ranges.iter().map(|r| r.count).collect();
+            let total: u32 = counts.iter().sum();
+            assert_eq!(total, 40, "only full windows are counted (perl_compat={perl_compat})");
+            let trans: f64 = model.gc_trans_counts.iter().flatten().sum();
+            assert_eq!(trans, 38.0, "19 transitions per chromosome (perl_compat={perl_compat})");
+        }
+        let _ = fs::remove_file(&tmp);
     }
 }

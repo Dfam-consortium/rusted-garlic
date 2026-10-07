@@ -236,6 +236,7 @@ rusted-garlic build --in_seq <FASTA_FILE> --model <MODEL_FILE> [OPTIONS]
 | `--gene_annot <TSV_FILE>` | 7-column gene annotation file for masking + profiling filter (see [Annotation file formats](#annotation-file-formats)) |
 | `--mask_exon` | Mask exon intervals only instead of whole gene bodies (requires exon columns in `--gene_annot`) |
 | `--filter_te_tandems` | Drop tandem repeats fully contained in a TE from the simple-repeat profile (avoids double counting; default keeps them, like GARLIC 1.4) |
+| `--perl_compat` | Reproduce GARLIC 1.4 GC binning and TE bin positions exactly, for comparison with the Perl version (see below) |
 
 All annotation files use 0-based half-open coordinates.  TEs and tandem repeats that overlap gene regions are excluded from their simulation profiles.  Tandem repeats fully contained within a TE interval are also excluded from the tandem profile.
 
@@ -394,9 +395,26 @@ rusted-garlic complexity --win 1000 chr1.fa chr2.fa chr3.fa > all_chrs.tsv
 
 #### `--perl_compat`
 
-`rusted-garlic` follows GARLIC 1.4 (`createFakeSequence.pl`) by default, except
-where the Perl behaviour is a bug.  `--perl_compat` reproduces those bugs so the two
-programs can be compared statistically (see `tier2/` in the project root):
+`build --perl_compat` and `emit --perl_compat` reproduce GARLIC 1.4 behaviour where
+`rusted-garlic` deliberately differs, so the two programs can be compared (see
+`tier2/` in the project root).  They are meant for validation and will eventually be
+removed.
+
+`build --perl_compat` (`createModel.pl`): GC bins, GC transitions, and the TE,
+simple-repeat and nested-insert tables are then identical to GARLIC 1.4 on human
+chr22.  K-mer frequencies still differ slightly because of Perl's repeat-masking bug
+(item 2 under "Differences from the original Perl GARLIC"), which is not reproduced.
+
+| GARLIC 1.4 behaviour | Default | `build --perl_compat` |
+|---|---|---|
+| GC bin cuts: one pass with bucket size `total / num_gc_bins`; a GC value holding several buckets' worth of windows merges them into one large bin, and the highest observed GC value never starts a bin | bin count lowered until every bin is non-empty, keeping populations even | Perl cuts |
+| Window GC histogram slot | `round(1000 * gc)` | `int(1000 * gc)` |
+| Chromosome's trailing partial window | binned by its own GC | last full window's GC repeated |
+| Smoothing span | ±5 windows | ±`int(10 kb / win_size / 2)` windows |
+| Bin ranges (and the k-mer fallback GC, which uses the range end) | midpoints between adjacent bins' observed GC | Perl cut points |
+| TE GC-bin position | midpoint of the span (0-based) | Perl: 1-based start, end of the last fragment read |
+
+`emit --perl_compat` (`createFakeSequence.pl`) reproduces these GARLIC 1.4 bugs:
 
 | GARLIC 1.4 bug | Default | `--perl_compat` |
 |---|---|---|
@@ -680,7 +698,7 @@ The build pipeline is three sequential passes over the input FASTA:
 
 1. **Pass 1** — raw GC content per `win_size` window → GC bin assignments (up to `num_gc_bins` bins), window counts, transition counts
 2. **Pass 2** — masked k-mer counting per GC bin (`kmer_size`-mer Markov model)
-3. **Pass 3** — TE and simple repeat profiling from annotation files, assigned to GC bins by midpoint position
+3. **Pass 3** — TE and simple repeat profiling from annotation files, assigned to GC bins by position (TE midpoint, simple-repeat start)
 
 The three model parameters (`win_size`, `kmer_size`, `num_gc_bins`) are stored in the JSON model file and re-used automatically at emit time.
 
@@ -710,46 +728,45 @@ All sequences are written to a single FASTA file.  When `num_seqs > 1` each reco
 
 ### Algorithmic differences that change output
 
-#### 1. Trailing partial window at end of chromosome
+#### 1. GC binning
 
-When the last window of a chromosome is shorter than `win_size`, the two implementations handle it differently.
+Both versions compute per-window GC, build a 0.1%-resolution histogram, cut it into up
+to `num_gc_bins` equal-population bins, smooth each window's GC over its neighbours
+and assign it to a bin.  The cut rule differs.  GARLIC 1.4 makes one pass with a fixed
+bucket size, so when a single GC value holds more than one bucket's worth of windows
+(very narrow isochores, or large `win_size`) it produces one oversized bin and keeps
+many small ones.  `rusted-garlic` lowers the bin count until every bin is non-empty,
+which keeps populations even at the cost of fewer bins.  With 1 kb windows on typical
+genomes (human, AT-rich, bimodal) both rules give the same bins.  Smaller differences
+(histogram rounding, the trailing partial window, smoothing span, bin range
+boundaries) are listed under `--perl_compat` above; `build --perl_compat` reproduces
+GARLIC 1.4 exactly.
 
-- **Perl**: reuses the GC value from the previous complete window for the partial window.
-- **Rust**: computes the actual GC fraction of the partial window's bases and uses that value.
+In both modes the smoothed GC is the mean of the neighbours' full-precision GC,
+rounded once to 0.1% (as Perl), and k-mers are binned by the window of their first
+base (as Perl).
 
-The difference is small (at most one window per chromosome) but will cause minor divergence in bin assignments for genomes with many short chromosomes/scaffolds.
+#### 2. Repeat masking covers the whole repeat
 
-#### 2. Bin boundary display (cosmetic — does not affect sequence generation)
+`maskRepeat` and `maskTRF` in GARLIC 1.4 mask `end − start − 1` bases, leaving the last
+2 bases of each RepeatMasker TE and the last base of each TRF repeat unmasked, so k-mers
+overlapping repeat ends are counted.  Rust masks the full annotated interval in both
+modes.  On chr22 this gives about 0.5% fewer k-mers per bin; with `build --perl_compat`
+the conditional k-mer frequencies are within 0.006 of Perl's.
 
-Both implementations use the same equal-population binning algorithm and the same smoothed-GC lookup table for window assignment during sequence generation.  Only the displayed GC range differs.
+#### 3. K-mer fallback for unobserved prefixes
 
-- **Perl**: displays `end[i] = start[i+1] − 1` (raw integer boundary).
-- **Rust**: displays the midpoint between the highest observed GC in bin *i* and the original start of bin *i+1* — `midpoint = (bin_actual_max[i] + original_start[i+1]) / 2`.  This gives a more intuitive "halfway between the clusters" boundary.
+When a k-mer prefix has no observations in a bin, both versions use a GC-based prior:
+`p` = the bin's upper GC bound, A and T get `(1 − p) / 2`, C and G get `p / 2` (Perl:
+`$c / 100` from the bin's range string).  The upper bound itself differs by default
+(see bin ranges under `--perl_compat`).
 
-Because `gc_lookup` (the actual per-window bin assignment table) is identical in both versions, the midpoint display change has no effect on sequences generated.
+#### 4. Repeat GC bin position
 
-#### 3. Bug fix — floating-point GC fraction for k-mer fallback
-
-When a k-mer prefix has no observations in a bin, a prior probability is used.  The GC fraction of a bin is `p_val = gc_ranges[bin].end / 1000.0`.
-
-- **Perl**: performed integer division (`/ 1000`), always yielding 0 for bins below 1000, so the fallback was always `A/T = 0.5, C/G = 0.5` regardless of actual bin GC content.
-- **Rust**: uses floating-point division (`/ 1000.0`), so the fallback correctly reflects each bin's GC fraction.
-
-This only affects rare k-mer prefixes that were never observed in a given bin; common prefixes are unaffected.
-
-#### 4. Bug fix — AT/GC frequency symmetry in k-mer fallback
-
-In the same fallback path, the Perl code computed frequencies for A, T, C, and G, but contained an error where A and T were both assigned `q_val / 2` (the AT-fraction half) while C and G were also assigned `q_val / 2` instead of `p_val / 2`.  The result was that all four bases received equal probability (each ≈ 0.25) regardless of the bin's GC content.
-
-- **Perl**: `freqA = freqT = freqC = freqG = q_val / 2` (bug — all equal).
-- **Rust**: `freqA = freqT = q_val / 2`; `freqC = freqG = p_val / 2` — correctly GC-biased.
-
-#### 5. Repeat midpoint vs. start for GC bin assignment
-
-During repeat profiling (Pass 3), each annotated repeat is assigned to a GC bin based on its position within the genome.
-
-- **Perl**: uses the repeat's start coordinate to look up the GC bin.
-- **Rust**: uses the midpoint `(start + end) / 2` of the repeat, which is more representative for long elements that may span a GC bin boundary.
+Each TE is assigned to the GC bin at the midpoint of its span; simple repeats use their
+start.  GARLIC 1.4 also uses the TE midpoint, but computes it from the 1-based
+RepeatMasker start and the end of the last fragment read (`--perl_compat` reproduces
+this).  The effect is a few TEs per bin on chr22.
 
 ### Features in `rusted-garlic` not present in Perl GARLIC
 

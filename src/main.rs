@@ -124,6 +124,12 @@ struct BuildArgs {
     #[arg(long = "filter_te_tandems")]
     filter_te_tandems: bool,
 
+    /// Reproduce GARLIC 1.4 GC binning and TE bin positions exactly, for
+    /// comparison with the Perl version (see README, "Differences from the
+    /// original Perl GARLIC")
+    #[arg(long = "perl_compat", alias = "perl-compat")]
+    perl_compat: bool,
+
     /// Window size in bp for GC isochore binning
     #[arg(short = 'w', long = "win_size", value_name = "INT", default_value = "1000")]
     win_size: usize,
@@ -381,6 +387,7 @@ fn run_build(args: BuildArgs) {
         kmer_size: args.kmer_size,
         num_gc_bins: args.num_gc_bins,
         filter_te_tandems: args.filter_te_tandems,
+        perl_compat: args.perl_compat,
     };
 
     info!("Building model from {:?}...", args.in_seq);
