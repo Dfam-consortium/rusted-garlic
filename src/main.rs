@@ -118,6 +118,11 @@ struct BuildArgs {
     #[arg(long = "mask_exon")]
     mask_exon: bool,
 
+    /// Exclude tandem repeats fully contained in a TE from the simple-repeat profile
+    /// (avoids double-counting; default keeps them, like GARLIC 1.4)
+    #[arg(long = "filter_te_tandems")]
+    filter_te_tandems: bool,
+
     /// Window size in bp for GC isochore binning
     #[arg(short = 'w', long = "win_size", value_name = "INT", default_value = "1000")]
     win_size: usize,
@@ -233,6 +238,13 @@ struct EmitArgs {
     /// Keep inserted repeats uppercase (default: lowercase / soft-masked)
     #[arg(long = "no_soft_mask")]
     no_soft_mask: bool,
+
+    /// Reproduce known GARLIC 1.4 bugs for side-by-side comparison with the Perl
+    /// version: inserted bases in evolved repeats are placed one base past the
+    /// context they were sampled for, and TE fragments longer than their consensus
+    /// are cut to a random 3' piece instead of the full consensus
+    #[arg(long = "perl_compat", alias = "perl-compat")]
+    perl_compat: bool,
 
     /// Write a BED file of inserted repeat locations alongside the sequence
     #[arg(long = "out_bed", value_name = "BED_FILE")]
@@ -362,6 +374,7 @@ fn run_build(args: BuildArgs) {
         win_size: args.win_size,
         kmer_size: args.kmer_size,
         num_gc_bins: args.num_gc_bins,
+        filter_te_tandems: args.filter_te_tandems,
     };
 
     info!("Building model from {:?}...", args.in_seq);
@@ -436,6 +449,7 @@ fn run_emit(args: EmitArgs) {
         te_frac: args.te_frac,
         sim_frac: args.sim_frac,
         soft_mask: !args.no_soft_mask,
+        perl_compat: args.perl_compat,
     };
 
     // --- Open output files --------------------------------------------------

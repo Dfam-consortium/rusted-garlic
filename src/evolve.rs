@@ -35,7 +35,7 @@ pub struct InsertRecord {
     pub strand: char,
 }
 
-// Maximum mutation retry cycles before relaxing acceptance (Perl's $mut_cyc).
+// Maximum number of k-mer-guided mutation rounds (Perl's $mut_cyc).
 const MUT_CYCLES: usize = 10;
 // Maximum insertion-attempt cycles (Perl's $ins_cyc).
 const INS_CYCLES: usize = 100;
@@ -113,7 +113,7 @@ fn sel_positions(len: usize, rng: &mut impl Rng) -> Vec<usize> {
 ///
 /// Each candidate position is accepted only when the transition increases the
 /// k-mer frequency in the background model (Perl's acceptance criterion).
-/// After `MUT_CYCLES` passes the check is skipped.
+/// With `eval >= MUT_CYCLES` the check is skipped (unused by `mutate_guided`).
 ///
 /// Returns the number of transitions *not* applied (skipped).
 fn add_transitions(
@@ -216,39 +216,72 @@ fn add_transversions(
     n
 }
 
+/// Signature shared by the guided point-mutation operators.
+type MutationOp<R> = fn(&mut Vec<u8>, usize, usize, &SeqModel, &mut R, usize) -> usize;
+
+/// Apply `n` mutations with Perl's retry semantics (`addTransitions` et al.).
+///
+/// Each round tries the remaining count with k-mer-guided acceptance.  Rejected
+/// mutations are retried in the next round against a newly drawn GC bin
+/// (Perl's `newGC()`), for at most `MUT_CYCLES` rounds; whatever is still
+/// rejected after that is dropped, so the realised divergence can fall short of
+/// the target.  Returns the number of mutations dropped.
+fn mutate_guided<R: Rng>(
+    op: MutationOp<R>,
+    seq: &mut Vec<u8>,
+    mut n: usize,
+    gc_bin: usize,
+    model: &SeqModel,
+    rng: &mut R,
+) -> usize {
+    let mut bin = gc_bin;
+    for eval in 0..MUT_CYCLES {
+        if n == 0 {
+            break;
+        }
+        n = op(seq, n, bin, model, rng, eval);
+        if n > 0 {
+            bin = model.sample_gc_bin(rng);
+        }
+    }
+    n
+}
+
 /// Apply up to `n` single-base insertions to `seq`, growing the vector.
 ///
-/// A base is sampled from the kmer model conditioned on the 3-mer prefix.
-/// The insertion is accepted when the downstream kmer frequency is below the
-/// sampled dice roll (biased toward locally-unusual positions, matching Perl).
+/// Mirrors Perl's `addInsertions`: one pass over ~len/2 random positions.  At
+/// each position a base is sampled from the k-mer model conditioned on the
+/// (k-1)-mer ending just before `pos`, and kept when the dice roll is at least
+/// the frequency of the downstream k-mer `seed[1..] + base + seq[pos]`.
+///
+/// The base is inserted at `pos`, between the seed and `seq[pos]` where it was
+/// evaluated.  With `perl_compat` it is placed *after* `seq[pos]` instead, as
+/// GARLIC 1.4 does (`substr($seq, $pos, 1) = "$old$n"`) — a Perl bug that leaves
+/// inserted bases out of context and raises CpG content in repeats.
 fn add_insertions(
     seq: &mut Vec<u8>,
     mut n: usize,
     gc_bin: usize,
     model: &SeqModel,
     rng: &mut impl Rng,
+    perl_compat: bool,
 ) {
     let kmer_size = model.kmer_size;
     let dna: [u8; 4] = [b'A', b'C', b'G', b'T'];
-    let mut pos_idx = 0usize;
-    let mut tried = 0usize;
-    while n > 0 && tried < seq.len().max(1) * 2 {
-        tried += 1;
-        let len = seq.len();
-        if len < kmer_size + 1 {
+    for pos in sel_positions(seq.len(), rng) {
+        if n == 0 {
             break;
         }
-        let pos = rng.gen_range(kmer_size..len);
-        // seed = seq[pos-(kmer_size-1)..pos]
+        if pos < kmer_size || pos >= seq.len() {
+            continue;
+        }
         let seed = &seq[pos - kmer_size + 1..pos];
-        // post = seq[pos]
         let post = seq[pos];
 
         // Sample new base from kmer distribution conditioned on seed
         let dice: f64 = rng.gen();
         let mut chosen = dna[3];
         let mut p = 0.0f64;
-        let mut found = false;
         for &b in &dna {
             let kmer: Vec<u8> = seed.iter().copied().chain(std::iter::once(b)).collect();
             let q = p + kmer_freq(model, gc_bin, &kmer);
@@ -256,30 +289,21 @@ fn add_insertions(
                 chosen = b;
             }
             if dice >= p && dice <= q + 1e-15 {
-                found = true;
                 break;
             }
             p = q;
         }
-        if !found {
-            pos_idx += 1;
-            continue;
-        }
 
-        // Downstream acceptance: seq[pos-(kmer_size-2)..pos] + chosen + post
-        let eed_start = pos - kmer_size + 2;
-        let mut downstream: Vec<u8> = seq[eed_start..pos].to_vec();
+        // Downstream acceptance: seed[1..] + chosen + post
+        let mut downstream: Vec<u8> = seed[1..].to_vec();
         downstream.push(chosen);
         downstream.push(post);
-        let f_down = kmer_freq(model, gc_bin, &downstream);
-        if dice < f_down + 1e-15 {
-            pos_idx += 1;
+        if dice < kmer_freq(model, gc_bin, &downstream) + 1e-15 {
             continue;
         }
 
-        seq.insert(pos, chosen);
+        seq.insert(if perl_compat { pos + 1 } else { pos }, chosen);
         n -= 1;
-        pos_idx = pos_idx.saturating_add(1);
     }
 }
 
@@ -333,12 +357,44 @@ fn add_deletions(
 // Repeat evolution
 // ---------------------------------------------------------------------------
 
+/// TE instances per (GC bin, repeat name), sorted by age ascending — Perl's
+/// `%byGCByRepeat`.  Used to pick nested inserts younger than their host.
+pub struct AgeIndex<'a> {
+    by_bin: Vec<HashMap<&'a str, Vec<(f64, &'a TeRepeat)>>>,
+}
+
+impl<'a> AgeIndex<'a> {
+    pub fn new(rm: &'a RepeatModel) -> Self {
+        let by_bin = rm
+            .te_profile
+            .iter()
+            .map(|reps| {
+                let mut m: HashMap<&str, Vec<(f64, &TeRepeat)>> = HashMap::new();
+                for r in reps {
+                    m.entry(r.name.as_str()).or_default().push((te_age(r, r.nfrg), r));
+                }
+                for v in m.values_mut() {
+                    v.sort_by(|x, y| x.0.partial_cmp(&y.0).unwrap());
+                }
+                m
+            })
+            .collect();
+        AgeIndex { by_bin }
+    }
+}
+
+/// Perl's "age" of a TE record: div + ins + del + 10 * fragments.
+fn te_age(rep: &TeRepeat, nfrg: u32) -> f64 {
+    rep.div + rep.ins + rep.del + nfrg as f64 * 10.0
+}
+
 /// Evolve one interspersed TE repeat and return its mutated sequence.
 ///
 /// Mirrors Perl's `evolveRepeat`.  Returns `None` when the consensus is not
 /// found or the fragment is too short.
 ///
-/// Nested insertions (from `insert_table`) are attempted when `rep.nfrg > 1`.
+/// Fragmented records (`nfrg > 1`) receive up to `nfrg` younger nested
+/// inserts drawn from the model's `insert_table` (see `get_insert`).
 pub fn evolve_repeat(
     rep: &TeRepeat,
     consensus: &HashMap<String, Vec<u8>>,
@@ -346,6 +402,27 @@ pub fn evolve_repeat(
     model: &SeqModel,
     rng: &mut impl Rng,
     rm: &RepeatModel,
+    ages: &AgeIndex,
+    perl_compat: bool,
+) -> Option<(Vec<u8>, char)> {
+    evolve_repeat_with(rep, rep.nfrg, f64::INFINITY, consensus, gc_bin, model, rng, rm, ages,
+                       perl_compat)
+}
+
+/// `evolve_repeat` with Perl's extra arguments: `nfrg` overrides the record's
+/// fragment count (nested inserts use 1, so they are not nested further) and
+/// records older than `max_age` are rejected.
+fn evolve_repeat_with(
+    rep: &TeRepeat,
+    nfrg: u32,
+    max_age: f64,
+    consensus: &HashMap<String, Vec<u8>>,
+    gc_bin: usize,
+    model: &SeqModel,
+    rng: &mut impl Rng,
+    rm: &RepeatModel,
+    ages: &AgeIndex,
+    perl_compat: bool,
 ) -> Option<(Vec<u8>, char)> {
     let cons = consensus.get(&rep.name)?;
     if cons.len() < 10 {
@@ -358,10 +435,28 @@ pub fn evolve_repeat(
         return None;
     }
 
+    let age = te_age(rep, nfrg);
+    if age > max_age {
+        return None;
+    }
+
     // Pick a random start position in the consensus.
-    let max_start = cons.len().saturating_sub(frag_len);
-    let ini = if max_start > 0 { rng.gen_range(0..max_start) } else { 0 };
-    let mut seq: Vec<u8> = cons[ini..ini + frag_len].to_vec();
+    let (ini, end) = if perl_compat && rep.length as usize > cons.len() {
+        // GARLIC 1.4 bug: Perl only caps the fragment length for range values,
+        // so `int(rand(len - frag))` gets a negative argument and `substr` takes a
+        // window anchored m bases before the end (m uniform in 0..frag-len),
+        // clipped to the consensus — usually a short 3' piece, not the full copy.
+        let len = cons.len() as i64;
+        let m = rng.gen_range(0..rep.length as i64 - len);
+        let start = if m == 0 { 0 } else { len - m };
+        let stop = start + rep.length as i64;
+        (start.clamp(0, len) as usize, stop.clamp(0, len) as usize)
+    } else {
+        let max_start = cons.len().saturating_sub(frag_len);
+        let ini = if max_start > 0 { rng.gen_range(0..max_start) } else { 0 };
+        (ini, ini + frag_len)
+    };
+    let mut seq: Vec<u8> = cons[ini..end].to_vec();
 
     // Random orientation.
     let orient_minus = rng.gen::<f64>() > 0.5;
@@ -377,71 +472,103 @@ pub fn evolve_repeat(
     let n_ins = (rep.ins * seq.len() as f64 / 100.0) as usize;
     let n_del = (rep.del * seq.len() as f64 / 100.0) as usize;
 
-    let skip_sit = add_transitions(&mut seq, n_sit, gc_bin, model, rng, 0);
-    if skip_sit > 0 {
-        add_transitions(&mut seq, skip_sit, gc_bin, model, rng, MUT_CYCLES);
-    }
-    let skip_ver = add_transversions(&mut seq, n_ver, gc_bin, model, rng, 0);
-    if skip_ver > 0 {
-        add_transversions(&mut seq, skip_ver, gc_bin, model, rng, MUT_CYCLES);
-    }
+    mutate_guided(add_transitions, &mut seq, n_sit, gc_bin, model, rng);
+    mutate_guided(add_transversions, &mut seq, n_ver, gc_bin, model, rng);
     if n_ins > 0 {
-        add_insertions(&mut seq, n_ins, gc_bin, model, rng);
+        add_insertions(&mut seq, n_ins, gc_bin, model, rng, perl_compat);
     }
-    let skip_del = add_deletions(&mut seq, n_del, gc_bin, model, rng, 0);
-    if skip_del > 0 {
-        add_deletions(&mut seq, skip_del, gc_bin, model, rng, MUT_CYCLES);
-    }
+    mutate_guided(add_deletions, &mut seq, n_del, gc_bin, model, rng);
 
-    // Nested insertions: if nfrg > 1, try to insert a younger element inside.
-    let age = rep.div + rep.ins + rep.del + (rep.nfrg as f64 * 10.0);
-    if rep.nfrg > 1 && age > 10.0 {
+    // Nested insertions (Perl: up to `break` inserts, `ins_cyc + 1` tries).
+    // Targets are drawn on the un-nested sequence and applied from the highest
+    // position down so earlier targets stay valid.
+    if nfrg > 1 && age > 10.0 && !seq.is_empty() {
         let outer_key = format!("{}#{}", rep.name, rep.family);
-        if let Some(inner_map) = rm.insert_table.get(gc_bin).and_then(|t| t.get(&outer_key)) {
-            if !inner_map.is_empty() {
-                // Sample one inner repeat type proportionally.
-                let dice: f64 = rng.gen();
-                let mut p = 0.0f64;
-                let mut chosen_inner: Option<&str> = None;
-                for (inner_key, &freq) in inner_map.iter() {
-                    p += freq;
-                    if dice <= p {
-                        chosen_inner = Some(inner_key.as_str());
+        let mut pending: Vec<(usize, Vec<u8>)> = Vec::new();
+        let mut num = 1u32;
+        for _ in 0..=INS_CYCLES {
+            num += 1;
+            match get_insert(&outer_key, age, consensus, gc_bin, model, rng, rm, ages, perl_compat) {
+                Some(ins) if !ins.is_empty() => {
+                    let target = rng.gen_range(0..seq.len());
+                    pending.push((target, ins));
+                    if num > nfrg {
                         break;
                     }
                 }
-                if let Some(inner_key) = chosen_inner {
-                    // Find a repeat instance of this inner type in the GC bin.
-                    let inner_name = inner_key.split('#').next().unwrap_or(inner_key);
-                    let candidates: Vec<&TeRepeat> = rm.te_profile[gc_bin]
-                        .iter()
-                        .filter(|r| r.name == inner_name)
-                        .collect();
-                    if !candidates.is_empty() {
-                        let inner_rep = *candidates.choose(rng).unwrap();
-                        // Only insert if younger than parent.
-                        let inner_age =
-                            inner_rep.div + inner_rep.ins + inner_rep.del + (inner_rep.nfrg as f64 * 10.0);
-                        if inner_age < age - 20.0 {
-                            if let Some((inner_seq, _)) =
-                                evolve_repeat(inner_rep, consensus, gc_bin, model, rng, rm)
-                            {
-                                if inner_seq.len() >= 10 && seq.len() > 1 {
-                                    let target = rng.gen_range(0..seq.len());
-                                    // Nested inserts are always lowercase (they are older elements).
-                                    let lc_inner: Vec<u8> =
-                                        inner_seq.iter().map(|b| b.to_ascii_lowercase()).collect();
-                                    seq.splice(target..target, lc_inner);
-                                }
-                            }
-                        }
-                    }
-                }
+                _ => num -= 1,
             }
+        }
+        // Stable sort: inserts sharing a target keep Perl's stacking order.
+        pending.sort_by(|x, y| y.0.cmp(&x.0));
+        for (target, ins) in pending {
+            let lc: Vec<u8> = ins.iter().map(|b| b.to_ascii_lowercase()).collect();
+            seq.splice(target..target, lc);
         }
     }
 
     Some((seq, strand))
+}
+
+/// Draw one nested insert for a host repeat — Perl's `getInsert`.
+///
+/// The inner type is sampled from `insert_table[gc_bin][host]`; an instance of
+/// it no older than max(host age - 20, 10) is chosen from the age-sorted list
+/// and evolved without further nesting.  Up to `MUT_CYCLES` tries.
+fn get_insert(
+    outer_key: &str,
+    age: f64,
+    consensus: &HashMap<String, Vec<u8>>,
+    gc_bin: usize,
+    model: &SeqModel,
+    rng: &mut impl Rng,
+    rm: &RepeatModel,
+    ages: &AgeIndex,
+    perl_compat: bool,
+) -> Option<Vec<u8>> {
+    let new_age = (age - 20.0).max(10.0);
+    let inner_map = rm.insert_table.get(gc_bin)?.get(outer_key)?;
+    // Perl requires at least two candidate inner types (`last unless $#rep > 0`).
+    if inner_map.len() < 2 {
+        return None;
+    }
+    for _ in 0..MUT_CYCLES {
+        let dice: f64 = rng.gen();
+        let mut p = 0.0f64;
+        let mut chosen: Option<&str> = None;
+        for (inner_key, &freq) in inner_map.iter() {
+            chosen = Some(inner_key.as_str());
+            p += freq;
+            if dice <= p {
+                break;
+            }
+        }
+        let inner_name = chosen?.split('#').next().unwrap_or("");
+        let empty = Vec::new();
+        let cands = ages.by_bin.get(gc_bin).and_then(|m| m.get(inner_name)).unwrap_or(&empty);
+
+        // Perl's binary search for the youngest-enough prefix of the age-sorted
+        // list, kept verbatim: an index of 0 counts as "none young enough".
+        let (mut min_idx, mut max_idx) = (0isize, cands.len() as isize - 1);
+        while max_idx - min_idx > 1 {
+            let thresh = min_idx + (max_idx - min_idx + 1) / 2;
+            if cands[thresh as usize].0 > new_age {
+                max_idx = thresh - 1;
+            } else {
+                min_idx = thresh;
+            }
+        }
+        if min_idx == 0 {
+            return None;
+        }
+        let inner = cands[rng.gen_range(0..=min_idx as usize)].1;
+        if let Some((s, _)) =
+            evolve_repeat_with(inner, 1, new_age, consensus, gc_bin, model, rng, rm, ages, perl_compat)
+        {
+            return Some(s);
+        }
+    }
+    None
 }
 
 /// Evolve one simple/tandem repeat and return its mutated sequence.
@@ -452,9 +579,10 @@ pub fn evolve_simple(
     gc_bin: usize,
     model: &SeqModel,
     rng: &mut impl Rng,
+    perl_compat: bool,
 ) -> Option<(Vec<u8>, char)> {
-    // Pick a random expansion count (simulate stored ranges).
-    let exp: usize = rng.gen_range(3..=20);
+    // Perl: `$seed x (int($exp) + 1)` with $exp the TRF copy number.
+    let exp: usize = sim.copy_num as usize + 1;
     let unit = sim.consensus.as_bytes();
     let mut seq: Vec<u8> = unit.iter().copied().cycle().take(unit.len() * exp).collect();
     if seq.len() < 10 {
@@ -472,21 +600,16 @@ pub fn evolve_simple(
     let n_sit = mut_count / 2;
     let n_ver = mut_count - n_sit;
     let n_id = (sim.indel * seq.len() as f64 / 100.0) as usize;
-    let n_del = rng.gen_range(0..=n_id.max(1));
-    let n_ins = n_id.saturating_sub(n_del);
+    // Perl: $ndel = int(rand $nid); the rest are insertions.
+    let n_del = if n_id > 0 { rng.gen_range(0..n_id) } else { 0 };
+    let n_ins = n_id - n_del;
 
-    if n_sit > 0 {
-        add_transitions(&mut seq, n_sit, gc_bin, model, rng, 0);
-    }
-    if n_ver > 0 {
-        add_transversions(&mut seq, n_ver, gc_bin, model, rng, 0);
-    }
+    mutate_guided(add_transitions, &mut seq, n_sit, gc_bin, model, rng);
+    mutate_guided(add_transversions, &mut seq, n_ver, gc_bin, model, rng);
     if n_ins > 0 {
-        add_insertions(&mut seq, n_ins, gc_bin, model, rng);
+        add_insertions(&mut seq, n_ins, gc_bin, model, rng, perl_compat);
     }
-    if n_del > 0 {
-        add_deletions(&mut seq, n_del, gc_bin, model, rng, 0);
-    }
+    mutate_guided(add_deletions, &mut seq, n_del, gc_bin, model, rng);
 
     Some((seq, strand))
 }
@@ -510,6 +633,7 @@ pub fn insert_te_repeats(
     te_frac: Option<f64>,
     soft_mask: bool,
     rng: &mut impl Rng,
+    perl_compat: bool,
 ) -> Vec<InsertRecord> {
     let target_frac = te_frac.unwrap_or_else(|| rng.gen_range(10.0f64..60.0));
     log::info!("  => inserting {:.1}% TE elements", target_frac);
@@ -518,6 +642,7 @@ pub fn insert_te_repeats(
     let mut repeat_bases: usize = 0;
     let mut tot_try: usize = 0;
     let ins_cycles = INS_CYCLES;
+    let ages = AgeIndex::new(repeat_model);
 
     loop {
         let cur_frac = 100.0 * repeat_bases as f64 / seq.len() as f64;
@@ -553,7 +678,7 @@ pub fn insert_te_repeats(
         let rep = &bin_reps[rng.gen_range(0..bin_reps.len())];
 
         // Evolve the repeat.
-        let (evolved, strand) = match evolve_repeat(rep, consensus, gc_bin, seq_model, rng, repeat_model) {
+        let (evolved, strand) = match evolve_repeat(rep, consensus, gc_bin, seq_model, rng, repeat_model, &ages, perl_compat) {
             Some(pair) if pair.0.len() >= 10 => pair,
             _ => continue,
         };
@@ -604,6 +729,7 @@ pub fn insert_simple_repeats(
     sim_frac: Option<f64>,
     soft_mask: bool,
     rng: &mut impl Rng,
+    perl_compat: bool,
 ) -> Vec<InsertRecord> {
     let target_frac = sim_frac.unwrap_or_else(|| rng.gen_range(0.0f64..2.0));
     log::info!("  => inserting {:.1}% low complexity sequences", target_frac);
@@ -642,7 +768,7 @@ pub fn insert_simple_repeats(
         }
         let sim = &bin_sims[rng.gen_range(0..bin_sims.len())];
 
-        let (evolved, strand) = match evolve_simple(sim, gc_bin, seq_model, rng) {
+        let (evolved, strand) = match evolve_simple(sim, gc_bin, seq_model, rng, perl_compat) {
             Some(pair) if pair.0.len() >= 10 => pair,
             _ => continue,
         };

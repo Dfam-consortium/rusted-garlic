@@ -68,6 +68,7 @@ fn resolve_iupac(b: u8, rng: &mut impl Rng) -> u8 {
         b'D' => *[b'A', b'T', b'G'].choose(rng).unwrap(),
         b'H' => *[b'A', b'T', b'C'].choose(rng).unwrap(),
         b'V' => *[b'A', b'C', b'G'].choose(rng).unwrap(),
-        _ => b'A',
+        // N and anything else: a random base (Perl's checkBases).
+        _ => *[b'A', b'C', b'G', b'T'].choose(rng).unwrap(),
     }
 }

@@ -231,6 +231,7 @@ rusted-garlic build --in_seq <FASTA_FILE> --model <MODEL_FILE> [OPTIONS]
 | `--tandem_annot <TSV_FILE>` | UCSC TRF BED file for masking + tandem repeat profiling (see [Annotation file formats](#annotation-file-formats)) |
 | `--gene_annot <TSV_FILE>` | 7-column gene annotation file for masking + profiling filter (see [Annotation file formats](#annotation-file-formats)) |
 | `--mask_exon` | Mask exon intervals only instead of whole gene bodies (requires exon columns in `--gene_annot`) |
+| `--filter_te_tandems` | Drop tandem repeats fully contained in a TE from the simple-repeat profile (avoids double counting; default keeps them, like GARLIC 1.4) |
 
 All annotation files use 0-based half-open coordinates.  TEs and tandem repeats that overlap gene regions are excluded from their simulation profiles.  Tandem repeats fully contained within a TE interval are also excluded from the tandem profile.
 
@@ -286,6 +287,7 @@ rusted-garlic emit --model <MODEL_FILE> --out_seq <FASTA_FILE> [OPTIONS]
 | Flag | Default | Description |
 |---|---|---|
 | `--no_soft_mask` | off | Keep inserted repeats uppercase (default: lower-case) |
+| `--perl_compat` | off | Reproduce known GARLIC 1.4 bugs, for side-by-side comparison with the Perl version (see below) |
 | `--out_bed <BED_FILE>` | — | Write legacy bombardment repeat insertion records as a 6-column BED file |
 
 #### Insertion modes *(planned)*
@@ -385,17 +387,32 @@ rusted-garlic complexity --win 1000 chr1.fa chr2.fa chr3.fa > all_chrs.tsv
 
 ---
 
+#### `--perl_compat`
+
+`rusted-garlic` follows GARLIC 1.4 (`createFakeSequence.pl`) by default, except
+where the Perl behaviour is a bug.  `--perl_compat` reproduces those bugs so the two
+programs can be compared statistically (see `tier2/` in the project root):
+
+| GARLIC 1.4 bug | Default | `--perl_compat` |
+|---|---|---|
+| Background windows: `createSubSeq` re-appends the (k-1)-base seed, so each "1 kb" window is win-k+2 bp; the shortfall is padded with a copy of a random internal segment | exact `win_size` windows | 998-bp windows with duplicated seed, padded end |
+| Evolved-repeat insertions: base sampled for the context before `pos` is placed after `seq[pos]` (raises CpG in repeats) | inserted in context | Perl placement |
+| TE records longer than their consensus: negative `rand()` offset makes `substr` return a random 3′ piece | full consensus | random 3′ piece |
+
 ## Model file format
 
 The model is a single JSON file containing:
 
 - `win_size` and `kmer_size` — the parameters used when the model was built (applied automatically at emit time)
 - Per-bin k-mer conditional frequencies (Markov model)
-- GC bin transition matrix
+- GC bin transition matrix (normalized, plus raw counts; `emit` adds a +1 pseudocount per cell like GARLIC 1.4)
+- Per-bin k-mer totals (weights for drawing a random GC bin during repeat mutation)
 - GC bin boundaries and window counts
 - Optional `repeat_model` object with per-bin TE and simple repeat records plus the nested-insertion frequency table
 
 The file is human-readable but not designed for hand-editing.
+
+> **Format version:** each model records `model_version`; `emit` refuses models from other versions with a "rebuild the model" error.  Models built by rusted-garlic 0.1.x (no version field) must be rebuilt with 0.2.0 — see `CHANGELOG.md`.
 
 > **Compatibility note:** Models built with different `win_size` or `kmer_size` values are not interchangeable.  If you rebuild a model with new parameters, regenerate any downstream sequences from the new model file.
 

@@ -29,6 +29,10 @@ pub struct EmitConfig<'a> {
     /// Lowercase inserted repeat sequences (Perl default).
     /// Set to `false` to keep insertions uppercase.
     pub soft_mask: bool,
+    /// Reproduce GARLIC 1.4 behaviour that is a known Perl bug (see
+    /// `evolve.rs`: `add_insertions` placement, over-long TE fragments).
+    /// Off by default.
+    pub perl_compat: bool,
 }
 
 /// Configuration passed to `SeqModel::model()` controlling masking and
@@ -50,6 +54,9 @@ pub struct ModelConfig<'a> {
     pub kmer_size: usize,
     /// Maximum number of GC bins to create (default: 25).
     pub num_gc_bins: usize,
+    /// Drop tandem repeats fully contained in a TE interval when profiling
+    /// simple repeats.  Off by default (Perl's `profileTRF` keeps them).
+    pub filter_te_tandems: bool,
 }
 
 #[derive(Debug, Copy, Clone, Serialize, Deserialize)]
@@ -59,8 +66,17 @@ struct GCRange {
     count: u32,
 }
 
+/// Model file format version written by `build` and required by `emit`.
+/// Bump whenever a change makes older model files unusable or wrong.
+///   2 (rusted-garlic 0.2.0): masking-drift fix, raw GC transition counts,
+///     per-bin k-mer totals, simple-repeat copy number.
+///   0: models without a version field (rusted-garlic 0.1.x).
+pub const MODEL_FORMAT_VERSION: u32 = 2;
+
 #[derive(Serialize, Deserialize)]
 pub struct SeqModel {
+    #[serde(default)]
+    model_version: u32,
     a_count: usize,
     c_count: usize,
     g_count: usize,
@@ -71,6 +87,12 @@ pub struct SeqModel {
     pub kmer_size: usize,
     gc_ranges: Vec<GCRange>,
     gc_trans: Vec<Vec<f64>>,
+    /// Raw GC-bin transition counts (before normalization).  Used by `emit` to
+    /// apply Perl's +1 pseudocount per cell (`loadGCt`).
+    gc_trans_counts: Vec<Vec<f64>>,
+    /// Per-bin k-mer totals (+1 per possible k-mer, as Perl's `loadKmers`);
+    /// weights for drawing a random GC bin (Perl's `newGC()`).
+    gc_kmer_totals: Vec<f64>,
     gc_binned_kmer_flank_freqs: Vec<HashMap<String, [f64; 4]>>,
     pub repeat_model: Option<RepeatModel>,
 }
@@ -78,6 +100,7 @@ pub struct SeqModel {
 impl SeqModel {
     pub fn new() -> Self {
         SeqModel {
+            model_version: MODEL_FORMAT_VERSION,
             a_count: 0,
             c_count: 0,
             g_count: 0,
@@ -88,9 +111,16 @@ impl SeqModel {
             kmer_size: 4,
             gc_ranges: Vec::new(),
             gc_trans: Vec::new(),
+            gc_trans_counts: Vec::new(),
+            gc_kmer_totals: Vec::new(),
             gc_binned_kmer_flank_freqs: Vec::new(),
             repeat_model: None,
         }
+    }
+
+    /// Draw a random GC bin weighted by its k-mer total, like Perl's `newGC()`.
+    pub fn sample_gc_bin(&self, rng: &mut impl Rng) -> usize {
+        WeightedIndex::new(&self.gc_kmer_totals).unwrap().sample(rng)
     }
 
     /// Look up the conditional frequencies `[P(A|pre), P(C|pre), P(G|pre), P(T|pre)]`
@@ -127,8 +157,24 @@ impl SeqModel {
             Err(err) => panic!("Could not deserialize the file, error code: {}", err),
         };
 
-        let module: SeqModel = serde_json::from_str(&contents.as_str())?;
-        Ok(module)
+        SeqModel::from_json(&contents)
+    }
+
+    /// Parse a model from JSON, refusing files from other model format versions.
+    /// The version is checked before full deserialization so that older models
+    /// get a clear "rebuild" message rather than a missing-field error.
+    pub fn from_json(contents: &str) -> Result<SeqModel, Box<dyn Error>> {
+        let value: serde_json::Value = serde_json::from_str(contents)?;
+        let version = value.get("model_version").and_then(|v| v.as_u64()).unwrap_or(0);
+        if version != MODEL_FORMAT_VERSION as u64 {
+            return Err(format!(
+                "model format version {} is not supported (expected {}); \
+                 rebuild the model with this version of rusted-garlic",
+                version, MODEL_FORMAT_VERSION
+            )
+            .into());
+        }
+        Ok(serde_json::from_value(value)?)
     }
 
     pub fn to_file(&self, path: impl AsRef<Path>) {
@@ -184,10 +230,12 @@ impl SeqModel {
             }
         }
 
+        // GC-bin transitions: like Perl's loadGCt, add one pseudocount to every
+        // cell so unobserved transitions remain possible.
         let mut gc_to_gc_weights: Vec<WeightedIndex<f64>> = Vec::new();
-        for i in 0..self.gc_ranges.len() {
-            let dist = WeightedIndex::new(&self.gc_trans[i]).unwrap();
-            gc_to_gc_weights.push(dist);
+        for row in self.gc_trans_counts.iter() {
+            let w: Vec<f64> = row.iter().map(|c| c + 1.0).collect();
+            gc_to_gc_weights.push(WeightedIndex::new(&w).unwrap());
         }
 
         let mut rng = thread_rng();
@@ -208,27 +256,65 @@ impl SeqModel {
         let prefixes: Vec<&String> = gc_kmer_prefix_weights[current_gc_bin].keys().collect();
         let seed_prefix = prefixes[rng.gen_range(0..prefixes.len())].clone();
         out_bytes.extend_from_slice(seed_prefix.as_bytes());
-        let mut km = seed_prefix;
 
-        while out_bytes.len() < bp_to_gen {
-            let nextbase = gc_kmer_prefix_weights[current_gc_bin]
-                .get(&km)
-                .expect("missing kmer prefix in model")
-                .sample(&mut rng);
-            let b: u8 = match nextbase {
-                0 => b'A',
-                1 => b'C',
-                2 => b'G',
-                3 => b'T',
-                _ => continue,
-            };
-            out_bytes.push(b);
-            km.push(b as char);
-            km.remove(0);
-            // Transition GC bin every win_size bases (Perl's createSeq outer loop).
-            if out_bytes.len() % self.win_size == 0 {
-                current_gc_bin = gc_to_gc_weights[current_gc_bin].sample(&mut rng);
+        let perl_compat = emit_cfg.map_or(false, |c| c.perl_compat);
+        if perl_compat {
+            // GARLIC 1.4 createSeq/createSubSeq, bug for bug: each window starts
+            // from the previous window's last k-1 bases and appends that seed
+            // *plus* win-2k+3 new bases, i.e. win-k+2 bp per window (998 for
+            // k=4) with the seed duplicated.  Windows therefore drift against
+            // pos/win_size, and checkSeqSize pads the shortfall by copying a
+            // random internal segment onto the end.
+            gc_bins.clear();
+            let k1 = self.kmer_size - 1;
+            let w = self.win_size - self.kmer_size + 1;
+            let mut i = out_bytes.len();
+            while i <= bp_to_gen + 100 {
                 gc_bins.push(current_gc_bin as u32);
+                let mut s: Vec<u8> = out_bytes[out_bytes.len() - k1..].to_vec();
+                while s.len() <= w {
+                    let km = std::str::from_utf8(&s[s.len() - k1..]).unwrap();
+                    let nextbase = gc_kmer_prefix_weights[current_gc_bin]
+                        .get(km)
+                        .expect("missing kmer prefix in model")
+                        .sample(&mut rng);
+                    s.push(b"ACGT"[nextbase]);
+                }
+                out_bytes.extend_from_slice(&s);
+                current_gc_bin = gc_to_gc_weights[current_gc_bin].sample(&mut rng);
+                i += self.win_size;
+            }
+            if out_bytes.len() > bp_to_gen {
+                out_bytes.truncate(bp_to_gen);
+            } else if out_bytes.len() < bp_to_gen {
+                let add = bp_to_gen - out_bytes.len();
+                let pos = rng.gen_range(0..out_bytes.len().saturating_sub(add).max(1));
+                let patch: Vec<u8> = out_bytes[pos..(pos + add).min(out_bytes.len())].to_vec();
+                out_bytes.extend(patch);
+            }
+        } else {
+            let mut km = seed_prefix;
+
+            while out_bytes.len() < bp_to_gen {
+                let nextbase = gc_kmer_prefix_weights[current_gc_bin]
+                    .get(&km)
+                    .expect("missing kmer prefix in model")
+                    .sample(&mut rng);
+                let b: u8 = match nextbase {
+                    0 => b'A',
+                    1 => b'C',
+                    2 => b'G',
+                    3 => b'T',
+                    _ => continue,
+                };
+                out_bytes.push(b);
+                km.push(b as char);
+                km.remove(0);
+                // Transition GC bin every win_size bases (Perl's createSeq outer loop).
+                if out_bytes.len() % self.win_size == 0 {
+                    current_gc_bin = gc_to_gc_weights[current_gc_bin].sample(&mut rng);
+                    gc_bins.push(current_gc_bin as u32);
+                }
             }
         }
 
@@ -251,6 +337,7 @@ impl SeqModel {
                         cfg.te_frac,
                         soft,
                         &mut rng,
+                        cfg.perl_compat,
                     );
                     all_records.extend(recs);
                 } else {
@@ -267,6 +354,7 @@ impl SeqModel {
                     cfg.sim_frac,
                     soft,
                     &mut rng,
+                    cfg.perl_compat,
                 );
                 all_records.extend(recs);
             } else if cfg.sim_frac.is_some() {
@@ -783,12 +871,25 @@ impl SeqModel {
         // Used by the repeat profiler to look up GC bin at any genomic position.
         let mut chrom_gc_bins: HashMap<String, Vec<u32>> = HashMap::new();
         let mut sentinel_idx: usize = 0; // index into chrom_names
+        let mut chr_windows: usize = 0; // windows pushed for the current chromosome
 
         for i in 0..bingc.len() {
             if bingc[i] == SQ_SENTINEL {
                 let cur_chrom = chrom_names.get(sentinel_idx).cloned().unwrap_or_default();
-                // finish up trailing windows for the current chromosome
-                for _n in 0..cmp::min(gc_queue.len(), 6) {
+                // Finish up the trailing windows for the current chromosome: the
+                // last min(windows, FLANK_WINDOWS) have not been emitted yet.  Window
+                // k averages windows max(0, k-FLANK)..end, so drop queue entries
+                // that fall left of that range before each emission.
+                let n_left = cmp::min(gc_queue.len(), FLANK_WINDOWS);
+                for t in 0..n_left {
+                    let k = chr_windows - n_left + t;
+                    while chr_windows - gc_queue.len() + FLANK_WINDOWS < k {
+                        let val = gc_queue.pop_front().unwrap();
+                        if val < NA_SENTINEL {
+                            gc_sum -= val;
+                            gc_cnt -= 1;
+                        }
+                    }
                     let mut gc_avg = NA_SENTINEL;
                     if gc_cnt > 0 {
                         // Round (not truncate) the smoothed GC mean: truncation biases
@@ -809,20 +910,13 @@ impl SeqModel {
                     // left-edge case above).
                     chrom_gc_bins.entry(cur_chrom.clone()).or_default().push(gc_bin);
                     next_dest_idx += 1;
-
-                    if gc_queue.len() >= FLANK_WINDOWS + 1 {
-                        let val = gc_queue.pop_front().unwrap();
-                        if val < NA_SENTINEL {
-                            gc_sum -= val;
-                            gc_cnt -= 1;
-                        }
-                    }
                 }
                 sentinel_idx += 1;
                 gc_sum = 0;
                 gc_cnt = 0;
                 prev_gc_bin = sentinel_bin;
                 gc_queue.clear();
+                chr_windows = 0;
                 continue;
             }
 
@@ -831,6 +925,7 @@ impl SeqModel {
                 gc_cnt += 1;
             }
             gc_queue.push_back(bingc[i]);
+            chr_windows += 1;
 
             // Complete windows case:
             // FLANK_WINDOWS .. |--------| .. FLANK_WINDOWS
@@ -998,6 +1093,15 @@ impl SeqModel {
                             continue;
                         }
 
+                        // Skip line breaks and other non-sequence bytes *before* the mask
+                        // check: counting them as positions in masked regions made
+                        // chr_bp_count drift ahead (one per FASTA line inside a mask),
+                        // shifting both mask lookups and GC-bin assignment downstream.
+                        // The accepted set matches the bytes Pass 1 counts as positions.
+                        if !b"ACGTNRYKMSWBDHVacgtnrykmswbdhv".contains(&ch) {
+                            continue;
+                        }
+
                         // Sequence data — check mask before deciding how to handle the base
                         let masked = mask_cursor
                             .as_mut()
@@ -1046,7 +1150,11 @@ impl SeqModel {
                     crate::io::IntervalMap::new()
                 };
                 if let Some(tpath) = cfg.tandem_annot_file {
-                    let te_opt = if te_ivs.is_empty() { None } else { Some(&te_ivs) };
+                    let te_opt = if cfg.filter_te_tandems && !te_ivs.is_empty() {
+                        Some(&te_ivs)
+                    } else {
+                        None
+                    };
                     log::info!("  Profiling tandem repeats from {:?}...", tpath);
                     profile_trf(tpath, &chrom_gc_bins, win_size as u32, &mut rm,
                                 te_opt, cfg.gene_filter);
@@ -1064,6 +1172,12 @@ impl SeqModel {
             let hm: HashMap<String, [f64; 4]> = HashMap::new();
             seq_model.gc_binned_kmer_flank_freqs.push(hm);
         }
+
+        let n_kmers = 4f64.powi(kmer_size as i32);
+        seq_model.gc_kmer_totals = maps
+            .iter()
+            .map(|m| m.values().sum::<u64>() as f64 + n_kmers)
+            .collect();
 
         let bases = vec!['A', 'C', 'G', 'T'];
         let mut bin_idx = 0;
@@ -1176,6 +1290,7 @@ impl SeqModel {
             println!("GC to GC counts");
         }
         let def_frq = 1 as f64 / seq_model.gc_ranges.len() as f64;
+        seq_model.gc_trans_counts = seq_model.gc_trans.clone();
         for i in 0..seq_model.gc_ranges.len() {
             let mut tot = 0.0 as f64;
             for j in 0..seq_model.gc_ranges.len() {
@@ -1273,6 +1388,7 @@ mod tests {
             win_size,
             kmer_size: 2,
             num_gc_bins,
+            filter_te_tandems: false,
         }
     }
 
@@ -1548,6 +1664,10 @@ mod tests {
             "no bin 0 → bin 1 transitions across chromosome boundary");
         assert_eq!(model.gc_trans[1][0], 0.0,
             "no bin 1 → bin 0 transitions across chromosome boundary");
+
+        // Raw counts are kept for emit's Perl-style +1 pseudocount:
+        // 10 windows per chromosome → 9 self-transitions each.
+        assert_eq!(model.gc_trans_counts, vec![vec![9.0, 0.0], vec![0.0, 9.0]]);
     }
 
     /// A single chromosome whose first half is all-AT (raw GC = 0) and
@@ -1738,5 +1858,51 @@ mod tests {
             assert!((sum - 1.0).abs() < 1e-10,
                 "bin {}, prefix '{}': frequencies must sum to 1.0", bin, prefix);
         }
+    }
+
+    /// Masked regions spanning FASTA line breaks must not advance the position
+    /// counter on newline bytes.  Previously each line break inside a mask was
+    /// counted as a base, so the counter drifted ahead and the mask (and GC-bin
+    /// lookup) ended early.  Here 600 masked A's span ten 60-bp lines; with the
+    /// drift the last ten A's escaped the mask and produced AA k-mers.
+    #[test]
+    fn test_mask_position_ignores_line_breaks() {
+        let tmp = std::env::temp_dir().join("garlic_test_mask_linebreaks.fa");
+        let mut seq = vec![b'A'; 600];
+        seq.extend(b"ACGT".repeat(150));
+        write_fasta(&tmp, &[("chr1", seq)]);
+
+        let mut ivs = crate::io::IntervalMap::new();
+        ivs.insert("chr1".to_string(), vec![(0, 600)]);
+        let mut mask = crate::masking::MaskSet::new();
+        mask.add(ivs);
+
+        let mut cfg = basic_config(100, 1);
+        cfg.mask = Some(&mask);
+        let model = SeqModel::model(&tmp, Some(&cfg));
+        let _ = fs::remove_file(&tmp);
+
+        assert_eq!(model.gc_ranges.len(), 1);
+        let a = model.gc_kmer_freq(0, "A").expect("prefix 'A' must be observed");
+        assert_eq!(a[0], 0.0, "P(A|A) must be 0: every A-run is masked");
+        assert!((a[1] - 1.0).abs() < 1e-10, "P(C|A) = 1.0 in the ACGT repeat");
+    }
+
+    /// Models from other format versions (or with no version field, i.e.
+    /// rusted-garlic 0.1.x) are refused with a "rebuild" message; current
+    /// models round-trip.
+    #[test]
+    fn test_model_format_version_check() {
+        let old = SeqModel::from_json(r#"{"a_count": 0}"#);
+        let msg = old.err().expect("unversioned model must be refused").to_string();
+        assert!(msg.contains("rebuild"), "unexpected error: {}", msg);
+
+        let tmp = std::env::temp_dir().join("garlic_test_model_version.fa");
+        write_fasta(&tmp, &[("chr1", make_sequence(500, 20, 100))]);
+        let model = SeqModel::model(&tmp, Some(&basic_config(100, 1)));
+        let _ = fs::remove_file(&tmp);
+        let json = serde_json::to_string(&model).unwrap();
+        let back = SeqModel::from_json(&json).expect("current model must load");
+        assert_eq!(back.model_version, MODEL_FORMAT_VERSION);
     }
 }

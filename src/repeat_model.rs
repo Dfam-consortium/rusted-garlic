@@ -77,12 +77,12 @@ impl<'de> Deserialize<'de> for TeRepeat {
 
 /// One simple/tandem repeat record.
 ///
-/// Serialized as a compact JSON array `[consensus, dir, period, div, indel]`.
+/// Serialized as a compact JSON array `[consensus, dir, copy_num, div, indel]`.
 #[derive(Debug, Clone)]
 pub struct SimpleRepeat {
     pub consensus: String, // repeat unit e.g. "AGAT"
     pub dir: char,         // canonical strand after revcomp check
-    pub period: u32,       // repeat unit length
+    pub copy_num: f64,     // TRF copy number (BED column 6; Perl $period / $exp)
     pub div: f64,          // divergence (100 - percent_match from TRF)
     pub indel: f64,        // indel rate from TRF
 }
@@ -93,7 +93,7 @@ impl Serialize for SimpleRepeat {
         let mut seq = s.serialize_seq(Some(5))?;
         seq.serialize_element(&self.consensus)?;
         seq.serialize_element(&self.dir.to_string())?;
-        seq.serialize_element(&self.period)?;
+        seq.serialize_element(&self.copy_num)?;
         seq.serialize_element(&self.div)?;
         seq.serialize_element(&self.indel)?;
         seq.end()
@@ -106,17 +106,17 @@ impl<'de> Deserialize<'de> for SimpleRepeat {
         impl<'de> serde::de::Visitor<'de> for V {
             type Value = SimpleRepeat;
             fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-                f.write_str("[consensus, dir, period, div, indel]")
+                f.write_str("[consensus, dir, copy_num, div, indel]")
             }
             fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut s: A) -> Result<SimpleRepeat, A::Error> {
                 use serde::de::Error;
                 let consensus: String = s.next_element()?.ok_or_else(|| A::Error::invalid_length(0, &self))?;
                 let dirs:      String = s.next_element()?.ok_or_else(|| A::Error::invalid_length(1, &self))?;
                 let dir = dirs.chars().next().ok_or_else(|| A::Error::custom("empty dir"))?;
-                let period:    u32    = s.next_element()?.ok_or_else(|| A::Error::invalid_length(2, &self))?;
+                let copy_num:  f64    = s.next_element()?.ok_or_else(|| A::Error::invalid_length(2, &self))?;
                 let div:       f64    = s.next_element()?.ok_or_else(|| A::Error::invalid_length(3, &self))?;
                 let indel:     f64    = s.next_element()?.ok_or_else(|| A::Error::invalid_length(4, &self))?;
-                Ok(SimpleRepeat { consensus, dir, period, div, indel })
+                Ok(SimpleRepeat { consensus, dir, copy_num, div, indel })
             }
         }
         d.deserialize_seq(V)
@@ -503,7 +503,8 @@ pub fn profile_trf(
         let seq_id = f[0];
         let ini: u32 = match f[1].parse() { Ok(v) => v, Err(_) => continue };
         let end: u32 = match f[2].parse() { Ok(v) => v, Err(_) => continue };
-        let period: u32 = match f[5].parse::<f64>() { Ok(v) => v as u32, Err(_) => continue };
+        // Column 6 is TRF's copy number (column 5 is the period).
+        let copy_num: f64 = match f[5].parse() { Ok(v) => v, Err(_) => continue };
         let pct_match: f64 = match f[7].parse() { Ok(v) => v, Err(_) => continue };
         let indel: f64 = match f[8].parse() { Ok(v) => v, Err(_) => continue };
         let div = 100.0 - pct_match;
@@ -537,11 +538,12 @@ pub fn profile_trf(
         let (canon_con, dir) = canonical_consensus(consensus);
 
         // Handle overlapping repeats: if this repeat overlaps the last one,
-        // keep whichever has the longer consensus (prefer more informative).
+        // keep whichever has the longer consensus; on a tie the newer record
+        // replaces the previous one (Perl's profileTRF).
         let ini_i = ini as i64;
         let end_i = end as i64;
         if ini_i >= last_ini && ini_i <= last_end {
-            if canon_con.len() <= last_consensus.len() {
+            if canon_con.len() < last_consensus.len() {
                 continue; // discard this one
             }
             // Replace the previous entry
@@ -553,7 +555,7 @@ pub fn profile_trf(
         model.simple_profile[gc].push(SimpleRepeat {
             consensus: canon_con.clone(),
             dir,
-            period,
+            copy_num,
             div,
             indel,
         });
