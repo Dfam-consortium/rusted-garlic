@@ -342,7 +342,9 @@ pub fn tsv_row(
     max_k: usize,
 ) -> String {
     let win = seq.len();
-    let wc = WindowCounts::new(seq, min_k, max_k);
+    // ct and cl at word size k use the counts of every size 1..=k, so count
+    // from 1; min_k only selects the output columns.
+    let wc = WindowCounts::new(seq, 1, max_k);
     let end = start + win;
 
     let mut vals: Vec<f64> = vec![
@@ -371,4 +373,26 @@ pub fn tsv_row(
         "{}\t{}\t{}\t{}\t{}\t{}\t{}",
         file, seq_name, start, end, win, wc.total, float_cols
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Restricting the output columns (min_k > 1) must not change ct/cl,
+    /// which need the counts of every word size from 1.
+    #[test]
+    fn test_min_k_only_selects_columns() {
+        let seq = b"ACGTTGCAAGGCTTACGATCGATCGGATCCATGCA".repeat(10);
+        let all = tsv_row(&seq, "f", "s", 0, 1, 4);
+        let some = tsv_row(&seq, "f", "s", 0, 3, 4);
+        let cols = |row: &str| row.split('\t').map(String::from).collect::<Vec<_>>();
+        let hdr_all = cols(&tsv_header(1, 4));
+        let hdr_some = cols(&tsv_header(3, 4));
+        let (a, b) = (cols(&all), cols(&some));
+        for (i, h) in hdr_some.iter().enumerate() {
+            let j = hdr_all.iter().position(|x| x == h).unwrap();
+            assert_eq!(b[i], a[j], "column {h}");
+        }
+    }
 }

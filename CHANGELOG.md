@@ -37,6 +37,16 @@ All notable changes to rusted-garlic. Validation details: `../tier2/README.md` a
   key order and TE records in genomic order instead of hash order. Existing
   `model_version` 2 models stay valid; no rebuild needed.
 
+### Fixed
+
+- `complexity --min_kmer` > 1 panicked (`ct`/`cl` need the counts of every word size
+  from 1); `min_kmer` now only selects output columns.
+- `complexity` options are `--min_kmer`/`--max_kmer` as documented (`--min-kmer`/
+  `--max-kmer` still accepted); duplicated defaults removed from `--help`.
+- Validated against `SeqComplex.pm`: all measures identical to its per-measure
+  subroutines except `cz`, where Perl's gzip header carries a temp-file name
+  (`../tier2/README.md`).
+
 ## [0.2.0] — 2026-10-07
 
 ### ⚠ Model incompatibility — rebuild all models

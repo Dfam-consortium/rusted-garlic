@@ -296,16 +296,16 @@ struct ComplexityArgs {
     #[arg(short = 's', long, value_name = "INT")]
     step: Option<usize>,
 
-    /// Skip windows where the non-ACGT fraction exceeds this value [default: 0.3]
+    /// Skip windows where the non-ACGT fraction exceeds this value
     #[arg(long, value_name = "FLOAT", default_value = "0.3")]
     nmax: f64,
 
-    /// Minimum k-mer word size for cm/ct/cl measures [default: 1]
-    #[arg(long, value_name = "INT", default_value = "1")]
+    /// Minimum k-mer word size for cm/ct/cl measures
+    #[arg(long = "min_kmer", alias = "min-kmer", value_name = "INT", default_value = "1")]
     min_kmer: usize,
 
-    /// Maximum k-mer word size for cm/ct/cl measures [default: 6]
-    #[arg(long, value_name = "INT", default_value = "6")]
+    /// Maximum k-mer word size for cm/ct/cl measures
+    #[arg(long = "max_kmer", alias = "max-kmer", value_name = "INT", default_value = "6")]
     max_kmer: usize,
 
     /// Output TSV file [default: stdout]
