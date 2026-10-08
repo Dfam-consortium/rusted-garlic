@@ -257,6 +257,12 @@ struct EmitArgs {
     #[arg(long = "out_bed", value_name = "BED_FILE")]
     out_bed: Option<PathBuf>,
 
+    /// Transition rate at CpG sites relative to other sites when evolving
+    /// repeats (1 = no CpG effect; ignored with --perl_compat).  The default
+    /// reproduces the CpG density of real human chr22 TEs
+    #[arg(long = "cpg_rate", value_name = "FLOAT", default_value = "7.0")]
+    cpg_rate: f64,
+
     /// Random seed; the same seed, model, inputs and version give identical output
     ///   [default: random; the seed used is logged]
     #[arg(long, value_name = "INT")]
@@ -399,6 +405,9 @@ fn run_build(args: BuildArgs) {
 }
 
 fn run_emit(args: EmitArgs) {
+    if !(args.cpg_rate >= 1.0) {
+        die("--cpg_rate must be >= 1 (1 = no CpG effect)");
+    }
     // --- Validate mode/flag combinations ------------------------------------
     if args.insert_features.is_some() {
         match args.insert_mode {
@@ -469,6 +478,7 @@ fn run_emit(args: EmitArgs) {
         sim_frac: args.sim_frac,
         soft_mask: !args.no_soft_mask,
         perl_compat: args.perl_compat,
+        cpg_rate: args.cpg_rate,
     };
 
     // --- Open output files --------------------------------------------------

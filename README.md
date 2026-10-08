@@ -295,6 +295,7 @@ rusted-garlic emit --model <MODEL_FILE> --out_seq <FASTA_FILE> [OPTIONS]
 | `--perl_compat` | off | Reproduce known GARLIC 1.4 bugs, for side-by-side comparison with the Perl version (see below) |
 | `--out_bed <BED_FILE>` | — | Write legacy bombardment repeat insertion records as a 6-column BED file |
 | `--seed <INT>` | random | Random seed. The same seed, model, inputs and rusted-garlic version reproduce the output exactly. The seed used is always logged. |
+| `--cpg_rate <FLOAT>` | `7` | Transition rate at CpG sites relative to other sites when evolving repeats (1 = no CpG effect). The default reproduces the CpG density of real human chr22 TEs. Ignored with `--perl_compat` |
 
 #### Insertion modes *(planned)*
 
@@ -422,6 +423,7 @@ chr22.  K-mer frequencies still differ slightly because of Perl's repeat-masking
 | Evolved-repeat insertions: base sampled for the context before `pos` is placed after `seq[pos]` (raises CpG in repeats) | inserted in context | Perl placement |
 | TE records longer than their consensus: negative `rand()` offset makes `substr` return a random 3′ piece | full consensus | random 3′ piece |
 | Deletions (`addDeletions`): scores removing the base at `pos + k − 1` but deletes the base at `pos`; all candidates judged on the unmodified sequence | deletes the scored base, one at a time on the current sequence | Perl |
+| No CpG effect: all sites mutate at the same rate, leaving simulated repeats far richer in CpG than real TEs | CpG sites mutate `--cpg_rate` (7) times faster | no CpG effect |
 
 ## Model file format
 

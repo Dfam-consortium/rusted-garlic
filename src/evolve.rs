@@ -35,6 +35,23 @@ pub struct InsertRecord {
     pub strand: char,
 }
 
+/// Options for repeat evolution.
+#[derive(Debug, Clone, Copy)]
+pub struct EvolveOpts {
+    /// Reproduce GARLIC 1.4 behaviour (see `--perl_compat`); also disables
+    /// the CpG rate.
+    pub perl_compat: bool,
+    /// Transition rate at CpG sites relative to other sites (1 = no CpG effect).
+    pub cpg_rate: f64,
+}
+
+impl EvolveOpts {
+    /// CpG rate in effect: 1 under `perl_compat` (GARLIC 1.4 has no CpG effect).
+    fn effective_cpg_rate(&self) -> f64 {
+        if self.perl_compat { 1.0 } else { self.cpg_rate }
+    }
+}
+
 // Maximum number of k-mer-guided mutation rounds (Perl's $mut_cyc).
 const MUT_CYCLES: usize = 10;
 // Maximum insertion-attempt cycles (Perl's $ins_cyc).
@@ -219,6 +236,47 @@ fn add_transversions(
         n -= 1;
     }
     n
+}
+
+/// Place CpG transitions in `seq` and return how many of the `n_sit`
+/// requested transitions they used.
+///
+/// The element's transitions are spread so that a site in a CpG dinucleotide
+/// mutates `cpg_rate` times as often as any other site: with `L` sites, `c`
+/// CpGs and per-site rate `r = n_sit / (L + (cpg_rate - 1) * 2c)`, the CpGs
+/// receive `cpg_rate * r * 2c` transitions (at most one per CpG, since the
+/// first destroys it).  Each turns CG into TG or CA (C->T or G->A, equally
+/// likely).  CpG decay is a mutation bias, not selection, so these are not
+/// checked against the k-mer model; the remaining transitions are.
+fn add_cpg_transitions(seq: &mut [u8], n_sit: usize, cpg_rate: f64, rng: &mut impl Rng) -> usize {
+    if cpg_rate <= 1.0 || n_sit == 0 {
+        return 0;
+    }
+    let mut cpgs: Vec<usize> = (0..seq.len().saturating_sub(1))
+        .filter(|&i| seq[i].to_ascii_uppercase() == b'C' && seq[i + 1].to_ascii_uppercase() == b'G')
+        .collect();
+    if cpgs.is_empty() {
+        return 0;
+    }
+    let (l, c) = (seq.len() as f64, cpgs.len() as f64);
+    let r = n_sit as f64 / (l + (cpg_rate - 1.0) * 2.0 * c);
+    let expected = (cpg_rate * r * 2.0 * c).min(c).min(n_sit as f64);
+    // Stochastic rounding keeps the expected count exact.
+    let mut k = expected.floor() as usize;
+    if rng.gen::<f64>() < expected.fract() {
+        k += 1;
+    }
+    for i in 0..k {
+        let j = rng.gen_range(i..cpgs.len());
+        cpgs.swap(i, j);
+        let pos = cpgs[i];
+        if rng.gen::<bool>() {
+            seq[pos] = b'T';
+        } else {
+            seq[pos + 1] = b'A';
+        }
+    }
+    k
 }
 
 /// Signature shared by the guided point-mutation operators.
@@ -417,10 +475,9 @@ pub fn evolve_repeat(
     rng: &mut impl Rng,
     rm: &RepeatModel,
     ages: &AgeIndex,
-    perl_compat: bool,
+    opts: EvolveOpts,
 ) -> Option<(Vec<u8>, char)> {
-    evolve_repeat_with(rep, rep.nfrg, f64::INFINITY, consensus, gc_bin, model, rng, rm, ages,
-                       perl_compat)
+    evolve_repeat_with(rep, rep.nfrg, f64::INFINITY, consensus, gc_bin, model, rng, rm, ages, opts)
 }
 
 /// `evolve_repeat` with Perl's extra arguments: `nfrg` overrides the record's
@@ -436,8 +493,9 @@ fn evolve_repeat_with(
     rng: &mut impl Rng,
     rm: &RepeatModel,
     ages: &AgeIndex,
-    perl_compat: bool,
+    opts: EvolveOpts,
 ) -> Option<(Vec<u8>, char)> {
+    let perl_compat = opts.perl_compat;
     let cons = consensus.get(&rep.name)?;
     if cons.len() < 10 {
         return None;
@@ -486,6 +544,7 @@ fn evolve_repeat_with(
     let n_ins = (rep.ins * seq.len() as f64 / 100.0) as usize;
     let n_del = (rep.del * seq.len() as f64 / 100.0) as usize;
 
+    let n_sit = n_sit - add_cpg_transitions(&mut seq, n_sit, opts.effective_cpg_rate(), rng);
     mutate_guided(add_transitions, &mut seq, n_sit, gc_bin, model, rng, perl_compat);
     mutate_guided(add_transversions, &mut seq, n_ver, gc_bin, model, rng, perl_compat);
     if n_ins > 0 {
@@ -502,7 +561,7 @@ fn evolve_repeat_with(
         let mut num = 1u32;
         for _ in 0..=INS_CYCLES {
             num += 1;
-            match get_insert(&outer_key, age, consensus, gc_bin, model, rng, rm, ages, perl_compat) {
+            match get_insert(&outer_key, age, consensus, gc_bin, model, rng, rm, ages, opts) {
                 Some(ins) if !ins.is_empty() => {
                     let target = rng.gen_range(0..seq.len());
                     pending.push((target, ins));
@@ -538,7 +597,7 @@ fn get_insert(
     rng: &mut impl Rng,
     rm: &RepeatModel,
     ages: &AgeIndex,
-    perl_compat: bool,
+    opts: EvolveOpts,
 ) -> Option<Vec<u8>> {
     let new_age = (age - 20.0).max(10.0);
     let inner_map = rm.insert_table.get(gc_bin)?.get(outer_key)?;
@@ -577,7 +636,7 @@ fn get_insert(
         }
         let inner = cands[rng.gen_range(0..=min_idx as usize)].1;
         if let Some((s, _)) =
-            evolve_repeat_with(inner, 1, new_age, consensus, gc_bin, model, rng, rm, ages, perl_compat)
+            evolve_repeat_with(inner, 1, new_age, consensus, gc_bin, model, rng, rm, ages, opts)
         {
             return Some(s);
         }
@@ -593,8 +652,9 @@ pub fn evolve_simple(
     gc_bin: usize,
     model: &SeqModel,
     rng: &mut impl Rng,
-    perl_compat: bool,
+    opts: EvolveOpts,
 ) -> Option<(Vec<u8>, char)> {
+    let perl_compat = opts.perl_compat;
     // Perl: `$seed x (int($exp) + 1)` with $exp the TRF copy number.
     let exp: usize = sim.copy_num as usize + 1;
     let unit = sim.consensus.as_bytes();
@@ -618,6 +678,7 @@ pub fn evolve_simple(
     let n_del = if n_id > 0 { rng.gen_range(0..n_id) } else { 0 };
     let n_ins = n_id - n_del;
 
+    let n_sit = n_sit - add_cpg_transitions(&mut seq, n_sit, opts.effective_cpg_rate(), rng);
     mutate_guided(add_transitions, &mut seq, n_sit, gc_bin, model, rng, perl_compat);
     mutate_guided(add_transversions, &mut seq, n_ver, gc_bin, model, rng, perl_compat);
     if n_ins > 0 {
@@ -647,7 +708,7 @@ pub fn insert_te_repeats(
     te_frac: Option<f64>,
     soft_mask: bool,
     rng: &mut impl Rng,
-    perl_compat: bool,
+    opts: EvolveOpts,
 ) -> Vec<InsertRecord> {
     let target_frac = te_frac.unwrap_or_else(|| rng.gen_range(10.0f64..60.0));
     log::info!("  => inserting {:.1}% TE elements", target_frac);
@@ -655,7 +716,6 @@ pub fn insert_te_repeats(
     let mut records: Vec<InsertRecord> = Vec::new();
     let mut repeat_bases: usize = 0;
     let mut tot_try: usize = 0;
-    let ins_cycles = INS_CYCLES;
     let ages = AgeIndex::new(repeat_model);
 
     loop {
@@ -664,7 +724,7 @@ pub fn insert_te_repeats(
             break;
         }
         tot_try += 1;
-        if tot_try > ins_cycles {
+        if tot_try >= INS_CYCLES {  // Perl: last if ++$tot_try >= $ins_cyc
             break;
         }
 
@@ -692,7 +752,7 @@ pub fn insert_te_repeats(
         let rep = &bin_reps[rng.gen_range(0..bin_reps.len())];
 
         // Evolve the repeat.
-        let (evolved, strand) = match evolve_repeat(rep, consensus, gc_bin, seq_model, rng, repeat_model, &ages, perl_compat) {
+        let (evolved, strand) = match evolve_repeat(rep, consensus, gc_bin, seq_model, rng, repeat_model, &ages, opts) {
             Some(pair) if pair.0.len() >= 10 => pair,
             _ => continue,
         };
@@ -743,7 +803,7 @@ pub fn insert_simple_repeats(
     sim_frac: Option<f64>,
     soft_mask: bool,
     rng: &mut impl Rng,
-    perl_compat: bool,
+    opts: EvolveOpts,
 ) -> Vec<InsertRecord> {
     let target_frac = sim_frac.unwrap_or_else(|| rng.gen_range(0.0f64..2.0));
     log::info!("  => inserting {:.1}% low complexity sequences", target_frac);
@@ -758,7 +818,7 @@ pub fn insert_simple_repeats(
             break;
         }
         tot_try += 1;
-        if tot_try > INS_CYCLES {
+        if tot_try >= INS_CYCLES {  // Perl: last if ++$tot_try >= $ins_cyc
             break;
         }
 
@@ -782,7 +842,7 @@ pub fn insert_simple_repeats(
         }
         let sim = &bin_sims[rng.gen_range(0..bin_sims.len())];
 
-        let (evolved, strand) = match evolve_simple(sim, gc_bin, seq_model, rng, perl_compat) {
+        let (evolved, strand) = match evolve_simple(sim, gc_bin, seq_model, rng, opts) {
             Some(pair) if pair.0.len() >= 10 => pair,
             _ => continue,
         };
@@ -844,6 +904,10 @@ mod tests {
         });
         SeqModel::from_json(&json.to_string()).unwrap()
     }
+
+    /// Default options without the CpG effect, so tests see the plain operators.
+    const PLAIN: EvolveOpts = EvolveOpts { perl_compat: false, cpg_rate: 1.0 };
+    const COMPAT: EvolveOpts = EvolveOpts { perl_compat: true, cpg_rate: 1.0 };
 
     const ALWAYS_A: [f64; 4] = [1.0, 0.0, 0.0, 0.0];
     const ALWAYS_G: [f64; 4] = [0.0, 0.0, 1.0, 0.0];
@@ -1026,14 +1090,14 @@ mod tests {
         let m = model_k2(&[]);
         let mut strands = std::collections::HashSet::new();
         for seed in 0..20 {
-            let (s, strand) = evolve_simple(&simple("CAG", 4.7), 0, &m, &mut rng(seed), false).unwrap();
+            let (s, strand) = evolve_simple(&simple("CAG", 4.7), 0, &m, &mut rng(seed), PLAIN).unwrap();
             let fwd = b"CAG".repeat(5);
             let expect = if strand == '+' { fwd.clone() } else { revcomp(&fwd) };
             assert_eq!(s, expect);
             strands.insert(strand);
         }
         assert_eq!(strands.len(), 2, "both orientations occur");
-        assert!(evolve_simple(&simple("AC", 1.0), 0, &m, &mut rng(0), false).is_none());
+        assert!(evolve_simple(&simple("AC", 1.0), 0, &m, &mut rng(0), PLAIN).is_none());
     }
 
     fn te(name: &str, length: u32, div: f64, nfrg: u32) -> TeRepeat {
@@ -1068,18 +1132,18 @@ mod tests {
         let ages = AgeIndex::new(&rm);
 
         for seed in 0..10 {
-            let (s, strand) = evolve_repeat(&te("X", 20, 0.0, 1), &cons, 0, &m, &mut rng(seed), &rm, &ages, false).unwrap();
+            let (s, strand) = evolve_repeat(&te("X", 20, 0.0, 1), &cons, 0, &m, &mut rng(seed), &rm, &ages, PLAIN).unwrap();
             assert_eq!(s.len(), 20);
             assert!(contains(x, &oriented(&s, strand)), "fragment comes from the consensus");
 
-            let (s, strand) = evolve_repeat(&te("X", 80, 0.0, 1), &cons, 0, &m, &mut rng(seed), &rm, &ages, false).unwrap();
+            let (s, strand) = evolve_repeat(&te("X", 80, 0.0, 1), &cons, 0, &m, &mut rng(seed), &rm, &ages, PLAIN).unwrap();
             assert_eq!(oriented(&s, strand), *x, "over-long record -> full consensus");
 
-            if let Some((s, strand)) = evolve_repeat(&te("X", 80, 0.0, 1), &cons, 0, &m, &mut rng(seed), &rm, &ages, true) {
+            if let Some((s, strand)) = evolve_repeat(&te("X", 80, 0.0, 1), &cons, 0, &m, &mut rng(seed), &rm, &ages, COMPAT) {
                 assert!(x.ends_with(&oriented(&s, strand)), "perl_compat -> 3' piece");
             }
         }
-        assert!(evolve_repeat(&te("Missing", 20, 0.0, 1), &cons, 0, &m, &mut rng(0), &rm, &ages, false).is_none());
+        assert!(evolve_repeat(&te("Missing", 20, 0.0, 1), &cons, 0, &m, &mut rng(0), &rm, &ages, PLAIN).is_none());
     }
 
     /// A fragmented, old host receives younger nested inserts (lower-case)
@@ -1104,7 +1168,7 @@ mod tests {
 
         let mut nested = 0;
         for seed in 0..10 {
-            let (s, _) = evolve_repeat(&host, &cons, 0, &m, &mut rng(seed), &rm, &ages, false).unwrap();
+            let (s, _) = evolve_repeat(&host, &cons, 0, &m, &mut rng(seed), &rm, &ages, PLAIN).unwrap();
             let upper = s.iter().filter(|b| b.is_ascii_uppercase()).count();
             let lower = s.len() - upper;
             assert_eq!(upper, 200, "host bases keep the fragment length");
@@ -1115,7 +1179,7 @@ mod tests {
 
         // Unfragmented hosts are never nested.
         let single = TeRepeat { nfrg: 1, ..host.clone() };
-        let (s, _) = evolve_repeat(&single, &cons, 0, &m, &mut rng(0), &rm, &ages, false).unwrap();
+        let (s, _) = evolve_repeat(&single, &cons, 0, &m, &mut rng(0), &rm, &ages, PLAIN).unwrap();
         assert!(s.iter().all(|b| b.is_ascii_uppercase()));
     }
 
@@ -1133,7 +1197,7 @@ mod tests {
         let gc_bins = vec![0u32; 200];
 
         let mut seq = background.clone();
-        let mut recs = insert_te_repeats(&mut seq, &gc_bins, &rm, &cons, &m, Some(30.0), true, &mut rng(7), false);
+        let mut recs = insert_te_repeats(&mut seq, &gc_bins, &rm, &cons, &m, Some(30.0), true, &mut rng(7), PLAIN);
         assert_eq!(seq.len(), background.len());
         let lower = seq.iter().filter(|b| b.is_ascii_lowercase()).count();
         let covered: usize = recs.iter().map(|r| r.end - r.start).sum();
@@ -1149,7 +1213,7 @@ mod tests {
         }
 
         let mut seq = background.clone();
-        let recs = insert_te_repeats(&mut seq, &gc_bins, &rm, &cons, &m, Some(30.0), false, &mut rng(7), false);
+        let recs = insert_te_repeats(&mut seq, &gc_bins, &rm, &cons, &m, Some(30.0), false, &mut rng(7), PLAIN);
         assert!(!recs.is_empty());
         assert!(seq.iter().all(|b| b.is_ascii_uppercase()), "no soft-masking");
         assert_ne!(seq, background);
@@ -1161,10 +1225,49 @@ mod tests {
         let mut rm = RepeatModel::new(1);
         rm.simple_profile[0].push(simple("CAG", 9.0));
         let mut seq: Vec<u8> = b"ACGT".repeat(2500);
-        let recs = insert_simple_repeats(&mut seq, &vec![0u32; 100], &rm, &m, Some(5.0), true, &mut rng(8), false);
+        let recs = insert_simple_repeats(&mut seq, &vec![0u32; 100], &rm, &m, Some(5.0), true, &mut rng(8), PLAIN);
         let covered: usize = recs.iter().map(|r| r.end - r.start).sum();
         assert!(covered >= 500);
         assert!(recs.iter().all(|r| r.end - r.start == 30 && r.family == "Simple_repeat"));
         assert_eq!(seq.iter().filter(|b| b.is_ascii_lowercase()).count(), covered);
+    }
+
+    /// CpG transitions: none without CpGs or with rate 1; otherwise each hit
+    /// turns one CG into TG or CA, at most one per CpG and never more than the
+    /// transitions requested, and nothing else changes.
+    #[test]
+    fn test_cpg_transitions() {
+        let mut no_cpg = b"ACAGTT".repeat(50);
+        assert_eq!(add_cpg_transitions(&mut no_cpg, 20, 10.0, &mut rng(1)), 0);
+        let mut seq = b"ACGTTACGGA".repeat(30); // 300 bp, 60 CpGs
+        assert_eq!(add_cpg_transitions(&mut seq.clone(), 20, 1.0, &mut rng(1)), 0);
+
+        let before = seq.clone();
+        let k = add_cpg_transitions(&mut seq, 20, 10.0, &mut rng(2));
+        // r = 20 / (300 + 9 * 120) = 0.0145; CpG share = 10 * r * 120 = 17.4
+        assert!((17..=18).contains(&k), "k = {k}");
+        let cg = |s: &[u8]| s.windows(2).filter(|w| w == b"CG").count();
+        assert_eq!(cg(&before) - cg(&seq), k);
+        for (i, (a, b)) in before.iter().zip(&seq).enumerate() {
+            if a != b {
+                let ok = (*a == b'C' && *b == b'T' && before[i + 1] == b'G')
+                      || (*a == b'G' && *b == b'A' && before[i - 1] == b'C');
+                assert!(ok, "only CG -> TG / CA at {i}");
+            }
+        }
+        // A high rate hits every CpG but never exceeds the requested count.
+        let mut seq2 = before.clone();
+        assert_eq!(add_cpg_transitions(&mut seq2, 30, 1000.0, &mut rng(3)), 30);
+        let mut seq3 = before.clone();
+        assert_eq!(add_cpg_transitions(&mut seq3, 500, 1000.0, &mut rng(3)), 60);
+        assert_eq!(cg(&seq3), 0);
+    }
+
+    /// --perl_compat disables the CpG rate.
+    #[test]
+    fn test_perl_compat_disables_cpg_rate() {
+        let o = EvolveOpts { perl_compat: true, cpg_rate: 10.0 };
+        assert_eq!(o.effective_cpg_rate(), 1.0);
+        assert_eq!(EvolveOpts { perl_compat: false, ..o }.effective_cpg_rate(), 10.0);
     }
 }

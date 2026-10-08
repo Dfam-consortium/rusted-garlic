@@ -125,6 +125,15 @@ pub struct EmitConfig<'a> {
     /// `evolve.rs`: `add_insertions` placement, over-long TE fragments).
     /// Off by default.
     pub perl_compat: bool,
+    /// Transition rate at CpG sites relative to other sites in evolved repeats
+    /// (1 = none).  Ignored with `perl_compat`.
+    pub cpg_rate: f64,
+}
+
+impl EmitConfig<'_> {
+    pub fn evolve_opts(&self) -> crate::evolve::EvolveOpts {
+        crate::evolve::EvolveOpts { perl_compat: self.perl_compat, cpg_rate: self.cpg_rate }
+    }
 }
 
 /// Configuration passed to `SeqModel::model()` controlling masking and
@@ -440,7 +449,7 @@ impl SeqModel {
                         cfg.te_frac,
                         soft,
                         rng,
-                        cfg.perl_compat,
+                        cfg.evolve_opts(),
                     );
                     all_records.extend(recs);
                 } else {
@@ -457,7 +466,7 @@ impl SeqModel {
                     cfg.sim_frac,
                     soft,
                     rng,
-                    cfg.perl_compat,
+                    cfg.evolve_opts(),
                 );
                 all_records.extend(recs);
             } else if cfg.sim_frac.is_some() {

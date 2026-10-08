@@ -15,8 +15,20 @@ All notable changes to rusted-garlic. Validation details: `../tier2/README.md` a
   rules, retry rounds, insertion placement (default vs `--perl_compat`), simple and TE
   repeat evolution, nested inserts, and TE/simple-repeat bombardment.
 
+### Added (CpG)
+
+- `emit --cpg_rate` (default **7**): in evolved repeats, a site in a CpG dinucleotide
+  receives transitions 7× as often as other sites (CG → TG / CA), within the element's
+  annotated divergence (RepeatMasker's `div` is raw mismatch, so it already includes
+  CpG decay). Calibrated on human chr22: simulated repeats now match real TEs in CpG
+  density (14.9 vs 14.8 CG/kb) and CG-containing 4-mers (0.0445 vs 0.0445); repeat
+  4-mer JSD vs real TEs 0.049 → 0.041. `--cpg_rate 1` disables; ignored with
+  `--perl_compat`.
+
 ### Changed
 
+- Repeat bombardment gives up after 100 attempts in a row without a placement,
+  counting as GARLIC 1.4 does (was: 101).
 - **Repeat deletions** (`emit`) remove the base whose removal was scored; GARLIC 1.4
   scored the k-mer for deleting `seq[pos + k - 1]` but deleted `seq[pos]`. Deletions
   are now applied one at a time against the current sequence. On chr22 (Tier 2):
