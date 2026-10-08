@@ -1,6 +1,6 @@
 # rusted-garlic
 
-A Rust port of [GARLIC](https://doi.org/10.1093/nar/gku356) — the **G**enome **AR**tificia**L** **I**ntergenic **C**ompendium sequence generator, originally written by Juan Caballero and Gwenlyn Glusman.
+Rusted-garlic is an independent Rust reimplementation of [GARLIC](https://doi.org/10.1093/nar/gku356) — the **G**enome **AR**tificia**L** **I**ntergenic **C**ompendium sequence generator, originally written by Juan Caballero and Gwenlyn Glusman.  It has since diverged from the original with several bugfixes, and some subtle changes to the approach (see PERL_VS_RUST_DIFFS.md).
 
 `rusted-garlic` reads a real genome (or any FASTA), builds a statistical model of its sequence composition, and then generates arbitrarily large synthetic DNA sequences that match the original genome's:
 

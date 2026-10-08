@@ -1,0 +1,38 @@
+cff-version: 1.2.0
+message: >-
+  If you use rusted-garlic, please cite this software and the original GARLIC
+  paper. rusted-garlic is an independent Rust reimplementation of GARLIC by
+  Juan Caballero and Gwenlyn Glusman; the original authors are not involved in
+  this project.
+title: rusted-garlic
+abstract: Generate realistic artificial DNA sequences (a Rust reimplementation of GARLIC).
+type: software
+authors:
+  - family-names: Hubley
+    given-names: R.
+version: 0.3.0
+license: GPL-3.0-or-later
+repository-code: "https://github.com/Dfam-consortium/rusted-garlic"
+preferred-citation:
+  type: article
+  title: Realistic artificial DNA sequences as negative controls for computational genomics
+  authors:
+    - family-names: Caballero
+      given-names: J.
+    - family-names: Smit
+      given-names: A. F.
+    - family-names: Hood
+      given-names: L.
+    - family-names: Glusman
+      given-names: G.
+  journal: Nucleic Acids Research
+  year: 2014
+  doi: 10.1093/nar/gku356
+references:
+  - type: software
+    title: GARLIC
+    authors:
+      - family-names: Caballero
+        given-names: J.
+    license: GPL-3.0-or-later
+    repository-code: "https://github.com/caballero/Garlic"

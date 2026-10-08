@@ -1,8 +1,10 @@
 [package]
 name = "rusted-garlic"
-authors = ["Juan Caballero","Gwenlyn Glusman", "Robert Hubley"]
+authors = ["Robert Hubley"]
 description = "Generate realistic artificial DNA sequences"
-version = "0.2.0"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/Dfam-consortium/rusted-garlic"
+version = "0.3.0"
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
