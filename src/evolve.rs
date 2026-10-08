@@ -109,10 +109,19 @@ fn sel_positions(len: usize, rng: &mut impl Rng) -> Vec<usize> {
 // Mutation operators
 // ---------------------------------------------------------------------------
 
+/// Whether a mutation that changes the frequencies of the k-mers it touches
+/// from `old` to `new` is acceptable: none may get less likely (GARLIC 1.4,
+/// `next if old >= new + 1e-15`).  Neutral changes are accepted; rejecting
+/// them too was tried and made repeat 4-mer spectra less like real TEs
+/// (PERL_VS_RUST_DIFFS.md, 2026-10-07).
+fn improves(old: &[f64], new: &[f64]) -> bool {
+    old.iter().zip(new).all(|(o, n)| *o < n + 1e-15)
+}
+
 /// Apply up to `n` A↔G / T↔C transitions to `seq`.
 ///
-/// Each candidate position is accepted only when the transition increases the
-/// k-mer frequency in the background model (Perl's acceptance criterion).
+/// Each candidate position is accepted only when neither k-mer the transition
+/// touches becomes less likely under the background model (see `improves`).
 /// With `eval >= MUT_CYCLES` the check is skipped (unused by `mutate_guided`).
 ///
 /// Returns the number of transitions *not* applied (skipped).
@@ -123,6 +132,7 @@ fn add_transitions(
     model: &SeqModel,
     rng: &mut impl Rng,
     eval: usize,
+    _perl_compat: bool,
 ) -> usize {
     let kmer_size = model.kmer_size;
     let len = seq.len();
@@ -148,18 +158,13 @@ fn add_transitions(
             let pre_old = &seq[pos - kmer_size..pos];
             let mut pre_new = pre_old.to_vec();
             pre_new[kmer_size - 1] = new;
-            let f_pre_old = kmer_freq(model, gc_bin, pre_old);
-            let f_pre_new = kmer_freq(model, gc_bin, &pre_new);
-            if f_pre_old >= f_pre_new + 1e-15 {
-                continue;
-            }
             // post context: kmer starting at pos-(kmer_size-1), including seq[pos]
             let post_old = &seq[pos - kmer_size + 1..pos + 1];
             let mut post_new = post_old.to_vec();
             post_new[kmer_size - 2] = new; // mutation is at index kmer_size-2 in post slice
-            let f_post_old = kmer_freq(model, gc_bin, post_old);
-            let f_post_new = kmer_freq(model, gc_bin, &post_new);
-            if f_post_old >= f_post_new + 1e-15 {
+            let old_f = [kmer_freq(model, gc_bin, pre_old), kmer_freq(model, gc_bin, post_old)];
+            let new_f = [kmer_freq(model, gc_bin, &pre_new), kmer_freq(model, gc_bin, &post_new)];
+            if !improves(&old_f, &new_f) {
                 continue;
             }
         }
@@ -177,6 +182,7 @@ fn add_transversions(
     model: &SeqModel,
     rng: &mut impl Rng,
     eval: usize,
+    _perl_compat: bool,
 ) -> usize {
     let kmer_size = model.kmer_size;
     let len = seq.len();
@@ -200,13 +206,12 @@ fn add_transversions(
             let pre_old = &seq[pos - kmer_size..pos];
             let mut pre_new = pre_old.to_vec();
             pre_new[kmer_size - 1] = new;
-            if kmer_freq(model, gc_bin, pre_old) >= kmer_freq(model, gc_bin, &pre_new) + 1e-15 {
-                continue;
-            }
             let post_old = &seq[pos - kmer_size + 1..pos + 1];
             let mut post_new = post_old.to_vec();
             post_new[kmer_size - 2] = new;
-            if kmer_freq(model, gc_bin, post_old) >= kmer_freq(model, gc_bin, &post_new) + 1e-15 {
+            let old_f = [kmer_freq(model, gc_bin, pre_old), kmer_freq(model, gc_bin, post_old)];
+            let new_f = [kmer_freq(model, gc_bin, &pre_new), kmer_freq(model, gc_bin, &post_new)];
+            if !improves(&old_f, &new_f) {
                 continue;
             }
         }
@@ -217,7 +222,7 @@ fn add_transversions(
 }
 
 /// Signature shared by the guided point-mutation operators.
-type MutationOp<R> = fn(&mut Vec<u8>, usize, usize, &SeqModel, &mut R, usize) -> usize;
+type MutationOp<R> = fn(&mut Vec<u8>, usize, usize, &SeqModel, &mut R, usize, bool) -> usize;
 
 /// Apply `n` mutations with Perl's retry semantics (`addTransitions` et al.).
 ///
@@ -233,13 +238,14 @@ fn mutate_guided<R: Rng>(
     gc_bin: usize,
     model: &SeqModel,
     rng: &mut R,
+    perl_compat: bool,
 ) -> usize {
     let mut bin = gc_bin;
     for eval in 0..MUT_CYCLES {
         if n == 0 {
             break;
         }
-        n = op(seq, n, bin, model, rng, eval);
+        n = op(seq, n, bin, model, rng, eval, perl_compat);
         if n > 0 {
             bin = model.sample_gc_bin(rng);
         }
@@ -309,8 +315,15 @@ fn add_insertions(
 
 /// Apply up to `n` single-base deletions to `seq`, shrinking the vector.
 ///
-/// A position is accepted when the resulting kmer has higher background
-/// frequency than the current kmer (Perl's deletion acceptance criterion).
+/// For a candidate base `d = seq[i]` (i = pos + k - 1) the k-mer ending at it,
+/// `seq[i-k+1..=i]`, is compared with the k-mer that replaces it once `d` is
+/// gone, `seq[i-k+1..i] + seq[i+1]`; the deletion is accepted unless the latter
+/// is less likely (see `improves`).  Deletions are applied one at a time, so each
+/// is judged on the current sequence.
+///
+/// With `perl_compat` this follows GARLIC 1.4 `addDeletions`, which scores the
+/// same k-mers but deletes `seq[pos]` (k - 1 bases earlier than the base it
+/// evaluated), with all candidates judged on the unmodified sequence.
 fn add_deletions(
     seq: &mut Vec<u8>,
     mut n: usize,
@@ -318,34 +331,35 @@ fn add_deletions(
     model: &SeqModel,
     rng: &mut impl Rng,
     eval: usize,
+    perl_compat: bool,
 ) -> usize {
     let kmer_size = model.kmer_size;
-    let len = seq.len();
-    // Collect positions to delete, then remove them in reverse order.
     let mut to_delete: Vec<usize> = Vec::new();
-    for pos in sel_positions(len, rng) {
+    for pos in sel_positions(seq.len(), rng) {
         if n == 0 {
             break;
         }
-        if pos < kmer_size || pos + kmer_size >= len {
+        if pos < kmer_size || pos + kmer_size >= seq.len() {
             continue;
         }
         if eval < MUT_CYCLES {
-            // old kmer = seq[pos..pos+kmer_size]
             let old_kmer = &seq[pos..pos + kmer_size];
-            // new kmer = seq[pos..pos+kmer_size-1] + seq[pos+kmer_size]
             let mut new_kmer = seq[pos..pos + kmer_size - 1].to_vec();
             new_kmer.push(seq[pos + kmer_size]);
             let f_old = kmer_freq(model, gc_bin, old_kmer);
             let f_new = kmer_freq(model, gc_bin, &new_kmer);
-            if f_old >= f_new + 1e-15 {
+            if !improves(&[f_old], &[f_new]) {
                 continue;
             }
         }
-        to_delete.push(pos);
+        if perl_compat {
+            to_delete.push(pos);
+        } else {
+            seq.remove(pos + kmer_size - 1);
+        }
         n -= 1;
     }
-    // Remove from highest index to lowest so indices stay valid.
+    // Perl marks deletions and removes them afterwards: highest index first.
     to_delete.sort_unstable_by(|a, b| b.cmp(a));
     for i in to_delete {
         seq.remove(i);
@@ -472,12 +486,12 @@ fn evolve_repeat_with(
     let n_ins = (rep.ins * seq.len() as f64 / 100.0) as usize;
     let n_del = (rep.del * seq.len() as f64 / 100.0) as usize;
 
-    mutate_guided(add_transitions, &mut seq, n_sit, gc_bin, model, rng);
-    mutate_guided(add_transversions, &mut seq, n_ver, gc_bin, model, rng);
+    mutate_guided(add_transitions, &mut seq, n_sit, gc_bin, model, rng, perl_compat);
+    mutate_guided(add_transversions, &mut seq, n_ver, gc_bin, model, rng, perl_compat);
     if n_ins > 0 {
         add_insertions(&mut seq, n_ins, gc_bin, model, rng, perl_compat);
     }
-    mutate_guided(add_deletions, &mut seq, n_del, gc_bin, model, rng);
+    mutate_guided(add_deletions, &mut seq, n_del, gc_bin, model, rng, perl_compat);
 
     // Nested insertions (Perl: up to `break` inserts, `ins_cyc + 1` tries).
     // Targets are drawn on the un-nested sequence and applied from the highest
@@ -604,12 +618,12 @@ pub fn evolve_simple(
     let n_del = if n_id > 0 { rng.gen_range(0..n_id) } else { 0 };
     let n_ins = n_id - n_del;
 
-    mutate_guided(add_transitions, &mut seq, n_sit, gc_bin, model, rng);
-    mutate_guided(add_transversions, &mut seq, n_ver, gc_bin, model, rng);
+    mutate_guided(add_transitions, &mut seq, n_sit, gc_bin, model, rng, perl_compat);
+    mutate_guided(add_transversions, &mut seq, n_ver, gc_bin, model, rng, perl_compat);
     if n_ins > 0 {
         add_insertions(&mut seq, n_ins, gc_bin, model, rng, perl_compat);
     }
-    mutate_guided(add_deletions, &mut seq, n_del, gc_bin, model, rng);
+    mutate_guided(add_deletions, &mut seq, n_del, gc_bin, model, rng, perl_compat);
 
     Some((seq, strand))
 }
@@ -802,4 +816,355 @@ pub fn insert_simple_repeats(
         tot_try = 0;
     }
     records
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::seq_model::MODEL_FORMAT_VERSION;
+    use rand::rngs::StdRng;
+    use std::collections::BTreeMap;
+
+    /// A one-bin model with k = 2: `freqs` maps each 1-base prefix to
+    /// [P(A|pre), P(C|pre), P(G|pre), P(T|pre)].  Unlisted prefixes are uniform.
+    fn model_k2(freqs: &[(&str, [f64; 4])]) -> SeqModel {
+        let mut table: BTreeMap<String, [f64; 4]> =
+            ["A", "C", "G", "T"].iter().map(|p| (p.to_string(), [0.25; 4])).collect();
+        for (p, f) in freqs {
+            table.insert(p.to_string(), *f);
+        }
+        let json = serde_json::json!({
+            "model_version": MODEL_FORMAT_VERSION,
+            "a_count": 0, "c_count": 0, "g_count": 0, "t_count": 0, "n_count": 0,
+            "source_sequence_size": 1000, "win_size": 100, "kmer_size": 2,
+            "gc_ranges": [{"start": 0, "end": 1000, "count": 10}],
+            "gc_trans": [[1.0]], "gc_trans_counts": [[9.0]], "gc_kmer_totals": [100.0],
+            "gc_binned_kmer_flank_freqs": [table],
+            "repeat_model": null,
+        });
+        SeqModel::from_json(&json.to_string()).unwrap()
+    }
+
+    const ALWAYS_A: [f64; 4] = [1.0, 0.0, 0.0, 0.0];
+    const ALWAYS_G: [f64; 4] = [0.0, 0.0, 1.0, 0.0];
+    const ALWAYS_T: [f64; 4] = [0.0, 0.0, 0.0, 1.0];
+
+    fn all(f: [f64; 4]) -> Vec<(&'static str, [f64; 4])> {
+        ["A", "C", "G", "T"].iter().map(|&p| (p, f)).collect()
+    }
+
+    fn rng(seed: u64) -> StdRng {
+        StdRng::seed_from_u64(seed)
+    }
+
+    fn count(seq: &[u8], b: u8) -> usize {
+        seq.iter().filter(|&&x| x == b).count()
+    }
+
+    #[test]
+    fn test_revcomp_and_kmer_freq() {
+        assert_eq!(revcomp(b"AACGTn"), b"NACGTT".to_vec());
+        let m = model_k2(&[("C", [0.1, 0.2, 0.3, 0.4])]);
+        assert_eq!(kmer_freq(&m, 0, b"CG"), 0.3);
+        assert_eq!(kmer_freq(&m, 0, b"cg"), 0.3, "case-insensitive");
+        assert_eq!(kmer_freq(&m, 0, b"CN"), 0.0, "non-ACGT suffix");
+        assert_eq!(kmer_freq(&m, 0, b"CGT"), 0.0, "wrong length");
+    }
+
+    /// About len/2 + 2 distinct positions, all in range (never more than len).
+    #[test]
+    fn test_sel_positions() {
+        let mut r = rng(1);
+        let p = sel_positions(1000, &mut r);
+        assert_eq!(p.len(), 502);
+        let uniq: std::collections::HashSet<_> = p.iter().collect();
+        assert_eq!(uniq.len(), p.len(), "positions are distinct");
+        assert!(p.iter().all(|&x| x < 1000));
+        assert_eq!(sel_positions(3, &mut r).len(), 3);
+        assert!(sel_positions(0, &mut r).is_empty());
+    }
+
+    /// The model only ever emits A, so G->A transitions always raise the
+    /// context k-mer frequencies: all n are applied, nothing else changes.
+    #[test]
+    fn test_transitions_applied_when_model_favours_them() {
+        let m = model_k2(&all(ALWAYS_A));
+        let mut seq = vec![b'G'; 200];
+        let left = add_transitions(&mut seq, 20, 0, &m, &mut rng(2), 0, false);
+        assert_eq!(left, 0);
+        assert_eq!(count(&seq, b'A'), 20);
+        assert_eq!(count(&seq, b'G'), 180);
+        assert_eq!(seq[0], b'G', "the first k-1 bases are never mutated");
+    }
+
+    /// The base that is evaluated is the one that changes.  On GTGT... with
+    /// P(A|.) = P(T|.) = 0.5, G->A raises the incoming k-mer and T->C lowers
+    /// it, so only G's mutate and every T survives.
+    #[test]
+    fn test_transition_mutates_the_evaluated_base() {
+        let m = model_k2(&all([0.5, 0.0, 0.0, 0.5]));
+        let mut seq: Vec<u8> = b"GT".repeat(100);
+        let dropped = mutate_guided(add_transitions, &mut seq, 30, 0, &m, &mut rng(9), false);
+        assert_eq!(dropped, 0);
+        assert_eq!(count(&seq, b'A'), 30);
+        assert_eq!(count(&seq, b'T'), 100);
+        assert_eq!(count(&seq, b'C'), 0);
+    }
+
+    /// One round visits only ~len/2 positions; further rounds (up to
+    /// MUT_CYCLES) are needed to place more mutations than that.
+    #[test]
+    fn test_mutations_retried_over_rounds() {
+        let m = model_k2(&all(ALWAYS_A));
+        let mut seq = vec![b'G'; 200];
+        let dropped = mutate_guided(add_transitions, &mut seq, 150, 0, &m, &mut rng(10), false);
+        assert_eq!(dropped, 0);
+        assert_eq!(count(&seq, b'A'), 150);
+    }
+
+    /// The model only emits G, so every G->A is rejected; after MUT_CYCLES
+    /// rounds the mutations are dropped and the sequence is unchanged.
+    #[test]
+    fn test_rejected_mutations_are_dropped() {
+        let m = model_k2(&all(ALWAYS_G));
+        let mut seq = vec![b'G'; 200];
+        let dropped = mutate_guided(add_transitions, &mut seq, 20, 0, &m, &mut rng(3), false);
+        assert_eq!(dropped, 20);
+        assert_eq!(seq, vec![b'G'; 200]);
+    }
+
+    #[test]
+    fn test_transversions_applied_when_model_favours_them() {
+        let m = model_k2(&all(ALWAYS_T));
+        let mut seq = vec![b'A'; 200];
+        let dropped = mutate_guided(add_transversions, &mut seq, 30, 0, &m, &mut rng(4), false);
+        assert_eq!(dropped, 0);
+        assert_eq!(count(&seq, b'T'), 30);
+        assert_eq!(seq.len(), 200);
+    }
+
+    /// Inserted bases are sampled from the context before `pos`: after C the
+    /// model emits A, after G it emits T.  By default the base goes right
+    /// after that context, so A follows C and T follows G.  With perl_compat
+    /// it lands one base later (after seq[pos]), so A follows G and T follows C.
+    #[test]
+    fn test_insertions_placed_in_context() {
+        let m = model_k2(&[("C", ALWAYS_A), ("G", ALWAYS_T)]);
+        let base: Vec<u8> = b"CG".repeat(100);
+        for perl_compat in [false, true] {
+            let mut seq = base.clone();
+            add_insertions(&mut seq, 10, 0, &m, &mut rng(5), perl_compat);
+            assert_eq!(seq.len(), 210, "all 10 insertions applied (perl_compat={perl_compat})");
+            // Pairs (preceding base, inserted base) for every inserted A or T.
+            let pairs: Vec<(u8, u8)> = seq.windows(2)
+                .filter(|w| w[1] == b'A' || w[1] == b'T')
+                .map(|w| (w[0], w[1]))
+                .collect();
+            assert_eq!(pairs.len(), 10);
+            let in_context = pairs.iter()
+                .filter(|&&p| p == (b'C', b'A') || p == (b'G', b'T'))
+                .count();
+            if perl_compat {
+                assert!(in_context <= 1, "Perl places bases after seq[pos]: {pairs:?}");
+            } else {
+                assert!(in_context >= 9, "default places bases in context: {pairs:?}");
+            }
+        }
+    }
+
+    /// A deletion is accepted when removing a base makes the k-mer ending
+    /// there more likely.  On ACAC... with P(A|A) = P(A|C) = 1, "AC" -> "AA"
+    /// passes, so the C's are deleted (by default deletions apply one at a
+    /// time, and an occasional A next to an earlier deletion is a neutral,
+    /// accepted change).  GARLIC 1.4 (`perl_compat`) scores the same k-mers
+    /// but removes the base k-1 earlier, an A.
+    #[test]
+    fn test_deletions() {
+        let m = model_k2(&[("A", ALWAYS_A), ("C", ALWAYS_A)]);
+        for perl_compat in [false, true] {
+            let mut seq: Vec<u8> = b"AC".repeat(100);
+            let dropped = mutate_guided(add_deletions, &mut seq, 15, 0, &m, &mut rng(6), perl_compat);
+            assert_eq!(dropped, 0, "perl_compat={perl_compat}");
+            assert_eq!(seq.len(), 185);
+            let (a_del, c_del) = (100 - count(&seq, b'A'), 100 - count(&seq, b'C'));
+            if perl_compat {
+                assert_eq!((a_del, c_del), (15, 0));
+            } else {
+                assert!(c_del >= 13, "mostly the scored C's: {a_del} A / {c_del} C deleted");
+            }
+        }
+
+        // A less likely k-mer is always rejected.
+        let worse = model_k2(&[("A", [0.0, 1.0, 0.0, 0.0]), ("C", ALWAYS_A)]);
+        for perl_compat in [false, true] {
+            let mut seq: Vec<u8> = b"AC".repeat(100);
+            assert_eq!(mutate_guided(add_deletions, &mut seq, 5, 0, &worse, &mut rng(6), perl_compat), 5);
+            assert_eq!(seq.len(), 200);
+        }
+    }
+
+    /// Neutral changes (no k-mer more or less likely) are accepted; a change
+    /// that makes any touched k-mer less likely is not.
+    #[test]
+    fn test_improves() {
+        assert!(improves(&[0.2, 0.5], &[0.3, 0.5]));
+        assert!(improves(&[0.2, 0.5], &[0.2, 0.5]), "ties accepted");
+        assert!(!improves(&[0.2, 0.5], &[0.9, 0.4]));
+        let m = model_k2(&[("A", ALWAYS_A)]);
+        let mut seq = vec![b'A'; 200];
+        assert_eq!(mutate_guided(add_deletions, &mut seq, 5, 0, &m, &mut rng(11), false), 0);
+        assert_eq!(seq.len(), 195);
+    }
+
+    fn simple(consensus: &str, copy_num: f64) -> SimpleRepeat {
+        SimpleRepeat { consensus: consensus.into(), dir: '+', copy_num, div: 0.0, indel: 0.0 }
+    }
+
+    /// int(copy_num) + 1 copies of the unit, either strand; < 10 bp -> None.
+    #[test]
+    fn test_evolve_simple() {
+        let m = model_k2(&[]);
+        let mut strands = std::collections::HashSet::new();
+        for seed in 0..20 {
+            let (s, strand) = evolve_simple(&simple("CAG", 4.7), 0, &m, &mut rng(seed), false).unwrap();
+            let fwd = b"CAG".repeat(5);
+            let expect = if strand == '+' { fwd.clone() } else { revcomp(&fwd) };
+            assert_eq!(s, expect);
+            strands.insert(strand);
+        }
+        assert_eq!(strands.len(), 2, "both orientations occur");
+        assert!(evolve_simple(&simple("AC", 1.0), 0, &m, &mut rng(0), false).is_none());
+    }
+
+    fn te(name: &str, length: u32, div: f64, nfrg: u32) -> TeRepeat {
+        TeRepeat { name: name.into(), family: "SINE/Alu".into(), dir: '+', div, ins: 0.0, del: 0.0,
+                   length, nfrg }
+    }
+
+    fn consensus(names: &[&str], len: usize) -> HashMap<String, Vec<u8>> {
+        let mut r = rng(99);
+        names.iter()
+            .map(|n| (n.to_string(), (0..len).map(|_| b"ACGT"[r.gen_range(0..4)]).collect()))
+            .collect()
+    }
+
+    fn oriented(s: &[u8], strand: char) -> Vec<u8> {
+        if strand == '-' { revcomp(s) } else { s.to_vec() }
+    }
+
+    fn contains(hay: &[u8], needle: &[u8]) -> bool {
+        hay.windows(needle.len()).any(|w| w == needle)
+    }
+
+    /// Without divergence the fragment is a piece of the consensus of the
+    /// record's length; a record longer than its consensus gives the full
+    /// consensus, or with perl_compat a 3' piece (GARLIC 1.4 bug).
+    #[test]
+    fn test_evolve_repeat_fragment() {
+        let m = model_k2(&[]);
+        let cons = consensus(&["X"], 50);
+        let x = &cons["X"];
+        let rm = RepeatModel::new(1);
+        let ages = AgeIndex::new(&rm);
+
+        for seed in 0..10 {
+            let (s, strand) = evolve_repeat(&te("X", 20, 0.0, 1), &cons, 0, &m, &mut rng(seed), &rm, &ages, false).unwrap();
+            assert_eq!(s.len(), 20);
+            assert!(contains(x, &oriented(&s, strand)), "fragment comes from the consensus");
+
+            let (s, strand) = evolve_repeat(&te("X", 80, 0.0, 1), &cons, 0, &m, &mut rng(seed), &rm, &ages, false).unwrap();
+            assert_eq!(oriented(&s, strand), *x, "over-long record -> full consensus");
+
+            if let Some((s, strand)) = evolve_repeat(&te("X", 80, 0.0, 1), &cons, 0, &m, &mut rng(seed), &rm, &ages, true) {
+                assert!(x.ends_with(&oriented(&s, strand)), "perl_compat -> 3' piece");
+            }
+        }
+        assert!(evolve_repeat(&te("Missing", 20, 0.0, 1), &cons, 0, &m, &mut rng(0), &rm, &ages, false).is_none());
+    }
+
+    /// A fragmented, old host receives younger nested inserts (lower-case)
+    /// chosen through the insert table; its own bases stay upper-case and,
+    /// with no indels, keep the host fragment length.
+    #[test]
+    fn test_nested_inserts() {
+        let m = model_k2(&[]);
+        let cons = consensus(&["Host", "X", "Y"], 300);
+        let mut rm = RepeatModel::new(1);
+        for name in ["X", "Y"] {
+            for div in [5.0, 6.0, 7.0] {
+                rm.te_profile[0].push(te(name, 40, div, 1));
+            }
+        }
+        let host = TeRepeat { family: "LINE/L1".into(), ..te("Host", 200, 40.0, 3) };
+        rm.insert_table[0].insert(
+            "Host#LINE/L1".into(),
+            [("X#SINE/Alu".to_string(), 0.5), ("Y#SINE/Alu".to_string(), 0.5)].into_iter().collect(),
+        );
+        let ages = AgeIndex::new(&rm);
+
+        let mut nested = 0;
+        for seed in 0..10 {
+            let (s, _) = evolve_repeat(&host, &cons, 0, &m, &mut rng(seed), &rm, &ages, false).unwrap();
+            let upper = s.iter().filter(|b| b.is_ascii_uppercase()).count();
+            let lower = s.len() - upper;
+            assert_eq!(upper, 200, "host bases keep the fragment length");
+            assert!(lower % 40 == 0 && lower <= 3 * 40, "whole 40-bp inserts, at most nfrg: {lower}");
+            nested += (lower > 0) as usize;
+        }
+        assert!(nested >= 8, "an old fragmented host usually gets inserts ({nested}/10)");
+
+        // Unfragmented hosts are never nested.
+        let single = TeRepeat { nfrg: 1, ..host.clone() };
+        let (s, _) = evolve_repeat(&single, &cons, 0, &m, &mut rng(0), &rm, &ages, false).unwrap();
+        assert!(s.iter().all(|b| b.is_ascii_uppercase()));
+    }
+
+    /// Bombardment overwrites background in place: length unchanged, target
+    /// coverage reached, records non-overlapping and exactly the lower-case
+    /// spans; without soft-masking nothing is lower-case.
+    #[test]
+    fn test_insert_te_repeats() {
+        let m = model_k2(&[]);
+        let cons = consensus(&["X", "Y"], 300);
+        let mut rm = RepeatModel::new(1);
+        rm.te_profile[0].push(te("X", 200, 10.0, 1));
+        rm.te_profile[0].push(te("Y", 300, 20.0, 1));
+        let background: Vec<u8> = b"ACGT".repeat(5000);
+        let gc_bins = vec![0u32; 200];
+
+        let mut seq = background.clone();
+        let mut recs = insert_te_repeats(&mut seq, &gc_bins, &rm, &cons, &m, Some(30.0), true, &mut rng(7), false);
+        assert_eq!(seq.len(), background.len());
+        let lower = seq.iter().filter(|b| b.is_ascii_lowercase()).count();
+        let covered: usize = recs.iter().map(|r| r.end - r.start).sum();
+        assert_eq!(lower, covered, "lower-case bases are exactly the inserted spans");
+        assert!(covered as f64 >= 0.30 * seq.len() as f64, "target coverage reached");
+        recs.sort_by_key(|r| r.start);
+        for w in recs.windows(2) {
+            assert!(w[0].end <= w[1].start, "inserts do not overlap");
+        }
+        for r in &recs {
+            assert!(seq[r.start..r.end].iter().all(|b| b.is_ascii_lowercase()));
+            assert!(r.name == "X" || r.name == "Y");
+        }
+
+        let mut seq = background.clone();
+        let recs = insert_te_repeats(&mut seq, &gc_bins, &rm, &cons, &m, Some(30.0), false, &mut rng(7), false);
+        assert!(!recs.is_empty());
+        assert!(seq.iter().all(|b| b.is_ascii_uppercase()), "no soft-masking");
+        assert_ne!(seq, background);
+    }
+
+    #[test]
+    fn test_insert_simple_repeats() {
+        let m = model_k2(&[]);
+        let mut rm = RepeatModel::new(1);
+        rm.simple_profile[0].push(simple("CAG", 9.0));
+        let mut seq: Vec<u8> = b"ACGT".repeat(2500);
+        let recs = insert_simple_repeats(&mut seq, &vec![0u32; 100], &rm, &m, Some(5.0), true, &mut rng(8), false);
+        let covered: usize = recs.iter().map(|r| r.end - r.start).sum();
+        assert!(covered >= 500);
+        assert!(recs.iter().all(|r| r.end - r.start == 30 && r.family == "Simple_repeat"));
+        assert_eq!(seq.iter().filter(|b| b.is_ascii_lowercase()).count(), covered);
+    }
 }

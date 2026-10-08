@@ -1,0 +1,26 @@
+# Test fixtures
+
+Used by `tests/determinism.rs` (Tier 3 regression tests).
+
+| File | Contents |
+|---|---|
+| `sm-example.fa` | 50 kb, 3 sequences (`ex1`–`ex3`); the GARLIC `sm-example` input |
+| `sm-example.te_annot.tsv` | RepeatMasker TE annotation of it (`utils/rm_align_to_tsv.py` format) |
+| `sm-example.fa.trf.bed` | TRF tandem-repeat annotation |
+| `sm-example.cons.fa` | The 38 Dfam 4.0 consensus sequences named in the TE annotation (CC0). `AluJb_short_` and `FLAM_C_short_` are not in Dfam 4.0 and are skipped, as in GARLIC 1.4. |
+| `golden/sm-example.model` | Expected `build` output |
+| `golden/sm-example.perl_compat.model` | Expected `build --perl_compat` output |
+| `golden/emit_seed1.{fa,bed}` | Expected `emit --seed 1` (2 × 20 kb, `--te_frac 40 --sim_frac 2`) |
+| `golden/emit_perl_compat_seed1.{fa,bed}` | Same with `--perl_compat` |
+
+The emit goldens are generated from `golden/sm-example.model`, so a build change and an
+emit change fail separate tests.
+
+Goldens depend on the exact random streams of `rand` (`StdRng`, pinned in `Cargo.lock`).
+Upgrading `rand` will change them; that is expected. After any intended output change:
+
+    GARLIC_UPDATE_GOLDEN=1 cargo test --release --test determinism build_
+    GARLIC_UPDATE_GOLDEN=1 cargo test --release --test determinism golden
+
+(the model golden first, because the emit goldens are generated from it). Then check
+`git diff --stat tests/data/golden` and commit.

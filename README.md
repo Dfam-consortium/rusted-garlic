@@ -421,6 +421,7 @@ chr22.  K-mer frequencies still differ slightly because of Perl's repeat-masking
 | Background windows: `createSubSeq` re-appends the (k-1)-base seed, so each "1 kb" window is win-k+2 bp; the shortfall is padded with a copy of a random internal segment | exact `win_size` windows | 998-bp windows with duplicated seed, padded end |
 | Evolved-repeat insertions: base sampled for the context before `pos` is placed after `seq[pos]` (raises CpG in repeats) | inserted in context | Perl placement |
 | TE records longer than their consensus: negative `rand()` offset makes `substr` return a random 3′ piece | full consensus | random 3′ piece |
+| Deletions (`addDeletions`): scores removing the base at `pos + k − 1` but deletes the base at `pos`; all candidates judged on the unmodified sequence | deletes the scored base, one at a time on the current sequence | Perl |
 
 ## Model file format
 

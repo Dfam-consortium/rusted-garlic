@@ -11,9 +11,18 @@ All notable changes to rusted-garlic. Validation details: `../tier2/README.md` a
   reproduced exactly. Without `--seed` a random seed is drawn and logged.
 - Regression tests (`tests/determinism.rs`, `cargo test --release`): build and seeded
   emit must be byte-identical across runs and match golden files in `tests/data/golden/`.
+- Unit tests for the emitter (`evolve.rs`): mutation operators and their acceptance
+  rules, retry rounds, insertion placement (default vs `--perl_compat`), simple and TE
+  repeat evolution, nested inserts, and TE/simple-repeat bombardment.
 
 ### Changed
 
+- **Repeat deletions** (`emit`) remove the base whose removal was scored; GARLIC 1.4
+  scored the k-mer for deleting `seq[pos + k - 1]` but deleted `seq[pos]`. Deletions
+  are now applied one at a time against the current sequence. On chr22 (Tier 2):
+  CpG o/e in repeats 0.330 → 0.314 (real TEs 0.285), repeat 4-mer spectrum slightly
+  closer to real TEs, background unchanged. `emit --perl_compat` keeps GARLIC 1.4
+  deletions.
 - `build --perl_compat`: GC binning and TE bin positions follow GARLIC 1.4 exactly
   (`calcBinGC`/`classGC`/`profileRMAlign`). On chr22 the GC bins, all 625 GC
   transition counts, and the TE, simple-repeat and nested-insert tables are then
