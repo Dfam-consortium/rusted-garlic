@@ -2,10 +2,8 @@
 
 All notable changes to rusted-garlic. Validation details: `VALIDATION.md`.
 
-## [Unreleased]
-
+## 0.3.0 - 2026-11-05
 ### Added
-
 - `emit --seed <INT>`: all randomness comes from one seeded RNG, so a run can be
   reproduced exactly. Without `--seed` a random seed is drawn and logged.
 - Regression tests (`tests/determinism.rs`, `cargo test --release`): build and seeded
@@ -16,9 +14,6 @@ All notable changes to rusted-garlic. Validation details: `VALIDATION.md`.
 - Unit tests for the emitter (`evolve.rs`): mutation operators and their acceptance
   rules, retry rounds, insertion placement (default vs `--perl_compat`), simple and TE
   repeat evolution, nested inserts, and TE/simple-repeat bombardment.
-
-### Added (CpG)
-
 - `emit --cpg_rate` (default **7**): in evolved repeats, a site in a CpG dinucleotide
   receives transitions 7× as often as other sites (CG → TG / CA), within the element's
   annotated divergence (RepeatMasker's `div` is raw mismatch, so it already includes
@@ -26,9 +21,7 @@ All notable changes to rusted-garlic. Validation details: `VALIDATION.md`.
   density (14.9 vs 14.8 CG/kb) and CG-containing 4-mers (0.0445 vs 0.0445); repeat
   4-mer JSD vs real TEs 0.049 → 0.041. `--cpg_rate 1` disables; ignored with
   `--perl_compat`.
-
 ### Changed
-
 - Repeat bombardment gives up after 100 attempts in a row without a placement,
   counting as GARLIC 1.4 does (was: 101).
 - **Repeat deletions** (`emit`) remove the base whose removal was scored; GARLIC 1.4
@@ -50,9 +43,7 @@ All notable changes to rusted-garlic. Validation details: `VALIDATION.md`.
 - `build` output is now byte-identical across runs. Model maps are written in sorted
   key order and TE records in genomic order instead of hash order. Existing
   `model_version` 2 models stay valid; no rebuild needed.
-
 ### Fixed
-
 - `complexity --min_kmer` > 1 panicked (`ct`/`cl` need the counts of every word size
   from 1); `min_kmer` now only selects output columns.
 - `complexity` options are `--min_kmer`/`--max_kmer` as documented (`--min-kmer`/
@@ -62,9 +53,7 @@ All notable changes to rusted-garlic. Validation details: `VALIDATION.md`.
   (`VALIDATION.md`).
 
 ## [0.2.0] — 2026-10-07
-
-### ⚠ Model incompatibility — rebuild all models
-
+### Model incompatibility — rebuild all models
 Models built with 0.1.x **must be rebuilt** with `rusted-garlic build`.
 
 - Models now carry `model_version` (currently **2**). `emit` refuses any other
@@ -75,9 +64,7 @@ Models built with 0.1.x **must be rebuilt** with `rusted-garlic build`.
   (per-bin k-mer totals).
 - Simple-repeat records: the third element is now the TRF copy number
   (`copy_num`, float) instead of a truncated integer misnamed `period`.
-
 ### Fixed — model building (`build`)
-
 - **k-mer table / GC-bin misassignment with masking.** FASTA newlines inside masked
   regions were counted as sequence positions, so the mask and GC-bin lookups drifted
   ahead (~0.9%, ≈450 kb by the end of chr22 with TE masking). Per-bin k-mer tables were
@@ -87,9 +74,7 @@ Models built with 0.1.x **must be rebuilt** with `rusted-garlic build`.
 - **Simple-repeat profile matches GARLIC 1.4:** tandem repeats inside TEs are kept by
   default; overlapping repeats with equal unit length keep the later record.
   Simple-repeat records are now identical to GARLIC 1.4 (5,692 on chr22).
-
 ### Fixed — sequence generation (`emit`)
-
 - **Repeat mutation follows GARLIC 1.4.** Rejected k-mer-guided mutations are retried
   for up to 10 rounds against a newly drawn GC bin, then dropped. Previously one guided
   round was followed by unguided forced mutations, leaving too much CpG in repeats.
@@ -100,9 +85,7 @@ Models built with 0.1.x **must be rebuilt** with `rusted-garlic build`.
   random 3–20; no forced deletion when no indels are requested.
 - **GC transitions** get a +1 pseudocount per cell; the GC bin for retry rounds is drawn
   by per-bin k-mer totals; `N` in TE consensi becomes a random base (all as GARLIC 1.4).
-
 ### Added
-
 - `emit --perl_compat` (alias `--perl-compat`): reproduces three GARLIC 1.4 bugs for
   side-by-side comparison. By default rusted-garlic fixes them:
   - inserted bases in evolved repeats placed one base past the context they were
@@ -119,5 +102,4 @@ Models built with 0.1.x **must be rebuilt** with `rusted-garlic build`.
   more different than two Perl runs).
 
 ## [0.1.0]
-
 Initial Rust port of GARLIC 1.4 (`createModel.pl` / `createFakeSequence.pl`).
