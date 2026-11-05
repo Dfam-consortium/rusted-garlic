@@ -1,7 +1,6 @@
 # Changelog
 
-All notable changes to rusted-garlic. Validation details: `../tier2/README.md` and
-`../PERL_VS_RUST_DIFFS.md`.
+All notable changes to rusted-garlic. Validation details: `VALIDATION.md`.
 
 ## [Unreleased]
 
@@ -11,6 +10,9 @@ All notable changes to rusted-garlic. Validation details: `../tier2/README.md` a
   reproduced exactly. Without `--seed` a random seed is drawn and logged.
 - Regression tests (`tests/determinism.rs`, `cargo test --release`): build and seeded
   emit must be byte-identical across runs and match golden files in `tests/data/golden/`.
+- Complexity test (`tests/complexity.rs`): `complexity` must match SeqComplex.pm on 199
+  test windows; the Perl values are committed in `tests/data/complexity/`, so no Perl is
+  needed.
 - Unit tests for the emitter (`evolve.rs`): mutation operators and their acceptance
   rules, retry rounds, insertion placement (default vs `--perl_compat`), simple and TE
   repeat evolution, nested inserts, and TE/simple-repeat bombardment.
@@ -57,7 +59,7 @@ All notable changes to rusted-garlic. Validation details: `../tier2/README.md` a
   `--max-kmer` still accepted); duplicated defaults removed from `--help`.
 - Validated against `SeqComplex.pm`: all measures identical to its per-measure
   subroutines except `cz`, where Perl's gzip header carries a temp-file name
-  (`../tier2/README.md`).
+  (`VALIDATION.md`).
 
 ## [0.2.0] — 2026-10-07
 

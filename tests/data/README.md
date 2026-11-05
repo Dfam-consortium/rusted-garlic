@@ -24,3 +24,14 @@ Upgrading `rand` will change them; that is expected. After any intended output c
 
 (the model golden first, because the emit goldens are generated from it). Then check
 `git diff --stat tests/data/golden` and commit.
+
+## `complexity/` (used by `tests/complexity.rs`)
+
+| File | Contents |
+|---|---|
+| `complexity/windows.fa` | 199 one-window records: 150 hg38 chr22 windows (10 with N), 40 windows of a rusted-garlic chr22 simulation, poly-A, di/tri/tetranucleotide repeats, 25% N, and 50, 7 and 1 bp records. Made by `validation/scripts/make_windows.py`. |
+| `complexity/seqcomplex_reference.tsv` | SeqComplex.pm's per-measure subroutines on each record (`NA` where Perl cannot compute it). |
+
+To regenerate the reference (needs SeqComplex.pm): `SEQCOMPLEX_HOME=<dir>
+sh validation/complexity.sh --regenerate`. `cz` and some 15th-digit values change from
+run to run on the Perl side; the test ignores `cz` and compares to 1e-6.

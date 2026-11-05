@@ -1,0 +1,143 @@
+name: Release
+
+on:
+  push:
+    tags:
+      # Both "0.3.0" and "v0.3.0" are accepted; the leading "v" is stripped
+      # when deriving VERSION.
+      - '[0-9]+.[0-9]+.[0-9]+*'
+      - 'v[0-9]+.[0-9]+.[0-9]+*'
+  # Manual trigger for a build-only smoke test: the archives are attached to the
+  # workflow run as artifacts, and the release job is skipped (it is tag-gated).
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  NAME: rusted-garlic
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+          - target: aarch64-apple-darwin
+            os: macos-latest
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust stable
+        run: rustup update stable
+
+      # Each runner builds natively for its own host, so no --target is passed
+      # and the binary lands in target/release/.  Guard against building the
+      # wrong thing on the wrong runner.
+      - name: Verify host triple matches the matrix target
+        shell: bash
+        run: |
+          HOST="$(rustc -vV | sed -n 's/^host: //p')"
+          if [ "${HOST}" != "${{ matrix.target }}" ]; then
+            echo "runner host triple ${HOST} != matrix target ${{ matrix.target }}" >&2
+            exit 1
+          fi
+
+      # The version of record is [package] version in Cargo.toml.
+      - name: Read version from Cargo.toml
+        shell: bash
+        run: |
+          VERSION="$(sed -n 's/^version *= *"\(.*\)"/\1/p' Cargo.toml | head -n1)"
+          if [ -z "${VERSION}" ]; then
+            echo "could not read version from Cargo.toml" >&2
+            exit 1
+          fi
+          echo "VERSION=${VERSION}" >> "${GITHUB_ENV}"
+
+      # A tag that disagrees with Cargo.toml would publish an archive whose name
+      # contradicts its contents.
+      - name: Check tag against Cargo.toml version
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          if [ "${TAG_VERSION}" != "${VERSION}" ]; then
+            echo "tag ${GITHUB_REF_NAME} implies version ${TAG_VERSION}," >&2
+            echo "but Cargo.toml says ${VERSION}." >&2
+            echo "Bump Cargo.toml and re-tag, or tag the right commit." >&2
+            exit 1
+          fi
+
+      # The release description comes from CHANGELOG.md, so catch a missing
+      # section here rather than after both platforms have built.
+      - name: Check CHANGELOG has a section for this version
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: bash .github/scripts/release_notes.sh "${GITHUB_REF_NAME#v}" > /dev/null
+
+      - name: Build
+        run: cargo build --release --locked
+
+      # The test suite is small and self-contained (fixtures and golden files
+      # are in tests/data/), so it runs on every platform before packaging.
+      - name: Test
+        run: cargo test --release --locked
+
+      # COPYFILE_DISABLE keeps macOS tar from injecting ._ AppleDouble entries.
+      - name: Package
+        shell: bash
+        env:
+          COPYFILE_DISABLE: '1'
+        run: |
+          PKG="${NAME}-${VERSION}"
+          mkdir -p "stage/${PKG}/bin"
+          cp "target/release/${NAME}" "stage/${PKG}/bin/"
+          cp README.md LICENSE CHANGELOG.md CITATION.cff "stage/${PKG}/"
+          ARCHIVE="${PKG}-${{ matrix.target }}.tar.gz"
+          tar -C stage -czf "${ARCHIVE}" "${PKG}"
+          echo "ARCHIVE=${ARCHIVE}" >> "${GITHUB_ENV}"
+
+      # The packaged binary must run and report the package version.
+      - name: Smoke-test the packaged binary
+        shell: bash
+        run: |
+          OUT="$("stage/${NAME}-${VERSION}/bin/${NAME}" --version)"
+          echo "${OUT}"
+          if [ "${OUT}" != "rusted_garlic ${VERSION}" ]; then
+            echo "binary reports '${OUT}', expected 'rusted_garlic ${VERSION}'" >&2
+            exit 1
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.target }}
+          path: ${{ env.ARCHIVE }}
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          bash .github/scripts/release_notes.sh "${GITHUB_REF_NAME#v}" > release_notes.md
+          gh release create "${{ github.ref_name }}" \
+            --title "rusted-garlic ${{ github.ref_name }}" \
+            --notes-file release_notes.md \
+            artifacts/*

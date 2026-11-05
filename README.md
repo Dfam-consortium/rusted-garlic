@@ -1,6 +1,8 @@
 # rusted-garlic
 
-Rusted-garlic is an independent Rust reimplementation of [GARLIC](https://doi.org/10.1093/nar/gku356) — the **G**enome **AR**tificia**L** **I**ntergenic **C**ompendium sequence generator, originally written by Juan Caballero and Gwenlyn Glusman.  It has since diverged from the original with several bugfixes, and some subtle changes to the approach (see PERL_VS_RUST_DIFFS.md).
+Rusted-garlic is an independent Rust reimplementation of [GARLIC](https://doi.org/10.1093/nar/gku356) — the **G**enome **AR**tificia**L** **I**ntergenic **C**ompendium sequence generator, originally written by Juan Caballero and Gwenlyn Glusman.  It has since diverged from the original with several bugfixes and some subtle changes to the approach; see [Differences from the original Perl GARLIC](#differences-from-the-original-perl-garlic), and [VALIDATION.md](VALIDATION.md) for how the port was checked against GARLIC 1.4.
+
+`rusted-garlic` is about 9× faster than GARLIC 1.4 at building a model and 10× faster at generating sequence, using less than half the memory (human chr22: model build 6 s vs 54 s; one 5 Mb sequence 5 s vs 53 s; see [VALIDATION.md](VALIDATION.md#performance)).
 
 `rusted-garlic` reads a real genome (or any FASTA), builds a statistical model of its sequence composition, and then generates arbitrarily large synthetic DNA sequences that match the original genome's:
 
@@ -771,6 +773,51 @@ start.  GARLIC 1.4 also uses the TE midpoint, but computes it from the 1-based
 RepeatMasker start and the end of the last fragment read (`--perl_compat` reproduces
 this).  The effect is a few TEs per bin on chr22.
 
+### Emission differences
+
+These change how `emit` evolves and places repeats.  `emit --perl_compat` restores
+GARLIC 1.4's behaviour for all of them.  Measurements are on human chr22; see
+[VALIDATION.md](VALIDATION.md) for the full comparison.
+
+#### 1. CpG decay in evolved repeats (`--cpg_rate`, default 7)
+
+GARLIC 1.4 mutates every site of an evolved repeat at the same rate, so simulated repeats
+keep far too many CpGs.  RepeatMasker's divergence already includes CpG decay, so
+`rusted-garlic` keeps each element's annotated divergence and redistributes its
+transitions: a site in a CpG mutates 7× as often as other sites (CG → TG / CA).
+Simulated repeats now match real TEs in CpG density (14.9 vs 14.8 CG per kb; Perl 24.1),
+and their 4-mer divergence from real TEs drops from 0.049 to 0.041.  `--cpg_rate 1`
+disables it.
+
+#### 2. Deletions remove the base that was scored
+
+When choosing a deletion, GARLIC 1.4 scores the effect of deleting one base
+(`seq[pos+k-1]`) but then deletes another (`seq[pos]`).  `rusted-garlic` deletes the
+scored base and applies deletions one at a time to the current sequence.
+
+#### 3. Insertions go where they were sampled
+
+GARLIC 1.4 samples an inserted base for the context before `pos` but places it after
+`seq[pos]`.  `rusted-garlic` places it where it was sampled.  The Perl placement raises
+CpG o/e in repeats (0.333 → 0.357).
+
+#### 4. Full-length TEs are not truncated
+
+In GARLIC 1.4 the length cap only applies to TE records with a consensus range; for the
+others (about 2.6% of records, mostly L1 and LTR elements) a negative random offset makes
+`substr` return a random 3′ piece instead of the full consensus.  `rusted-garlic` uses
+the full consensus, which gives about 2% fewer, longer TEs.
+
+#### 5. Exact window length
+
+GARLIC 1.4 emits each "1 kb" window as 998 bp (the 3-bp k-mer seed is duplicated), so
+windows drift against sequence position, and the shortfall at the end is padded with a
+copy of a random internal segment.  `rusted-garlic` emits exact windows.  The drift
+smooths window GC and inflates its autocorrelation, most visibly on small inputs.
+
+Ties in the k-mer acceptance test follow GARLIC 1.4's rule in both modes; a stricter rule
+was tested and fit real repeat 4-mers worse.
+
 ### Features in `rusted-garlic` not present in Perl GARLIC
 
 | Feature | Description |
@@ -798,7 +845,7 @@ this).  The effect is a few TEs per bin on chr22.
 ## AI Assistance Disclosure
 This tool was written with the assistance of AI coding agents (Claude, GitHub Copilot).
 
-Correctness is validated by comparing output against Garlic v1.5 on a suite of real assembly datasets - not by manual code review alone. The background sequence modeling/simulation algorithm was hand-coded, however AI generated the full Garlic interface implementation; humans defined the validation criteria and verified the results.
+Correctness is validated by comparing output against GARLIC 1.4 on human chr22 and GARLIC's `sm-example` dataset - not by manual code review alone. The background sequence modeling/simulation algorithm was hand-coded, however AI generated the full Garlic interface implementation; humans defined the validation criteria and verified the results.
 
 See VALIDATION.md for full validation methodology.
 
