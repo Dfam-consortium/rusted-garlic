@@ -4,8 +4,9 @@
 #
 # The section runs from "## <version> ..." (or "## [<version>] ...", Keep a Changelog
 # style) to the next "## " heading, without the heading itself.  Hard-wrapped lines are joined, because GitHub shows each line
-# break in a release description as a break on the page.  Exits non-zero if the
-# section is missing or empty.
+# break in a release description as a break on the page.  If the section is
+# missing or empty, warns on stderr and prints a pointer to CHANGELOG.md instead,
+# so a forgotten entry never blocks a release.
 set -euo pipefail
 
 if [ $# -lt 1 ] || [ $# -gt 2 ]; then
@@ -37,7 +38,11 @@ notes="$(awk -v version="$version" '
 ' "$changelog")"
 
 if [ -z "$notes" ]; then
-    echo "no \"## [$version]\" section with any content in $changelog" >&2
-    exit 1
+    echo "::warning::no \"## [$version]\" section with any content in $changelog; using boilerplate release notes" >&2
+    if [ -n "${GITHUB_REPOSITORY:-}" ] && [ -n "${GITHUB_REF_NAME:-}" ]; then
+        notes="See details in [CHANGELOG.md](https://github.com/$GITHUB_REPOSITORY/blob/$GITHUB_REF_NAME/CHANGELOG.md)."
+    else
+        notes="See details in CHANGELOG.md."
+    fi
 fi
 printf '%s\n' "$notes"

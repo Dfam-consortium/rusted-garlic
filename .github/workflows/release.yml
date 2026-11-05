@@ -73,9 +73,10 @@ jobs:
             exit 1
           fi
 
-      # The release description comes from CHANGELOG.md, so catch a missing
-      # section here rather than after both platforms have built.
-      - name: Check CHANGELOG has a section for this version
+      # The release description comes from CHANGELOG.md.  A missing section no
+      # longer fails the build (the notes fall back to a pointer to the file),
+      # but flag it early as a warning annotation on the run.
+      - name: Check CHANGELOG has a section for this version (warn only)
         if: startsWith(github.ref, 'refs/tags/')
         shell: bash
         run: bash .github/scripts/release_notes.sh "${GITHUB_REF_NAME#v}" > /dev/null
